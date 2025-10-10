@@ -158,82 +158,6 @@ class GC_Block(nn.Module):
         
         return torch.cat(sw_concat, dim=1)
 
-# 极简Mamba替代方案 - 直接替换GC_Block
-class SimpleMambaBlock(nn.Module):
-    """极简Mamba替代，专注于时序建模"""
-    def __init__(self, input_channels, output_features, hidden_dim=64):
-        super().__init__()
-        self.input_channels = input_channels
-        self.output_features = output_features
-        self.hidden_dim = hidden_dim
-        
-        # 时序建模层
-        self.conv1 = nn.Conv1d(input_channels, hidden_dim, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2, dilation=2)
-        self.conv3 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=4, dilation=4)
-        
-        self.activation = nn.ELU()
-        self.dropout = nn.Dropout(0.1)
-        
-        # 全局特征提取
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.output_layer = nn.Linear(hidden_dim, output_features)
-        
-    def forward(self, x):
-        # x: (batch, channels, time)
-        batch_size, channels, time_steps = x.shape
-        
-        # 时序建模
-        x_conv = self.conv1(x)
-        x_conv = self.activation(x_conv)
-        x_conv = self.dropout(x_conv)
-        
-        x_conv = self.conv2(x_conv)
-        x_conv = self.activation(x_conv)
-        x_conv = self.dropout(x_conv)
-        
-        x_conv = self.conv3(x_conv)
-        x_conv = self.activation(x_conv)
-        
-        # 全局池化
-        x_pooled = self.global_pool(x_conv)  # (batch, hidden_dim, 1)
-        x_pooled = x_pooled.squeeze(-1)      # (batch, hidden_dim)
-        
-        # 输出
-        x_out = self.output_layer(x_pooled)  # (batch, output_features)
-        
-        return x_out
-
-class SimpleMambaGC_Block(nn.Module):
-    """极简Mamba GC Block - 直接处理整个序列"""
-    def __init__(self, input_channels, output_features, n_windows=5):
-        super().__init__()
-        self.input_channels = input_channels
-        self.output_features = output_features
-        self.n_windows = n_windows
-        
-        # 简化的Mamba模块
-        self.mamba = SimpleMambaBlock(
-            input_channels=input_channels, 
-            output_features=output_features,
-            hidden_dim=64
-        )
-        
-        # SE注意力
-        self.se_block = SE_Block(seize=2, BandSE=True)
-        
-    def forward(self, x):
-        # x shape: (batch, channels, time)
-        batch_size, C, T = x.shape
-        
-        # 应用SE注意力
-        x_se = self.se_block(x)
-        
-        # 直接通过Mamba处理整个序列
-        x_out = self.mamba(x_se)  # (batch, output_features)
-        
-        return x_out
-
 # 原始EEG_DBNet（使用GC_Block）
 class EEG_DBNet(nn.Module):
     def __init__(self, nb_classes=4, Chans=22, Samples=1125, regRate=0.25, d=4, k=4, n=6, s=1, se=2):
@@ -259,26 +183,88 @@ class EEG_DBNet(nn.Module):
         x = self.fc(x)
         return x
 
-# 使用极简Mamba的EEG_DBNet
-class EEG_DBNet_SimpleMamba(nn.Module):
+# 极简但有效的Mamba替代方案 - 直接改进GC_Block
+class MambaStyleBlock(nn.Module):
+    """Mamba风格的时序建模块，专注于长程依赖"""
+    def __init__(self, input_channels, output_features, hidden_dim=64):
+        super().__init__()
+        self.input_channels = input_channels
+        self.output_features = output_features
+        
+        # 1. 时序特征提取 - 使用扩张卷积捕获长程依赖
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(input_channels, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2, dilation=2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=4, dilation=4),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ELU(),
+        )
+        
+        # 2. 全局特征聚合
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # 3. 输出投影
+        self.output_proj = nn.Linear(hidden_dim, output_features)
+        
+    def forward(self, x):
+        # x: (batch, channels, time)
+        
+        # 时序特征提取
+        temporal_features = self.temporal_conv(x)  # (batch, hidden_dim, time)
+        
+        # 全局特征聚合
+        global_features = self.global_pool(temporal_features)  # (batch, hidden_dim, 1)
+        global_features = global_features.squeeze(-1)  # (batch, hidden_dim)
+        
+        # 输出投影
+        output = self.output_proj(global_features)  # (batch, output_features)
+        
+        return output
+
+class MambaStyleGC_Block(nn.Module):
+    """Mamba风格的GC Block - 直接替代原有GC_Block"""
+    def __init__(self, input_channels, output_features, n_windows=5):
+        super().__init__()
+        self.input_channels = input_channels
+        self.output_features = output_features
+        self.n_windows = n_windows
+        
+        # Mamba风格模块
+        self.mamba_block = MambaStyleBlock(
+            input_channels=input_channels,
+            output_features=output_features,
+            hidden_dim=64
+        )
+        
+    def forward(self, x):
+        # x shape: (batch, channels, time)
+        # 直接通过Mamba风格块处理
+        output = self.mamba_block(x)  # (batch, output_features)
+        return output
+
+# 使用Mamba风格的EEG_DBNet
+class EEG_DBNet_MambaStyle(nn.Module):
     def __init__(self, nb_classes=4, Chans=22, Samples=1125, regRate=0.25, d=4, k=4, n=6, s=1, se=2):
-        super(EEG_DBNet_SimpleMamba, self).__init__()
+        super(EEG_DBNet_MambaStyle, self).__init__()
         
         # 保持原有的LC_Block不变
         self.lc_block1 = LC_Block(F1=8, kernLength=48, Chans=Chans, dropout=0.3, activation='elu', AveragePooling=True)
         self.lc_block2 = LC_Block(F1=16, kernLength=64, Chans=Chans, dropout=0.3, activation='elu', AveragePooling=False)
         
-        # 用SimpleMambaGC_Block替换原有的GC_Block
-        # 第一个分支：输入16通道，输出n*16个特征
-        self.gc_block1 = SimpleMambaGC_Block(
+        # 用MambaStyleGC_Block替换原有的GC_Block
+        # 保持与原始相同的输出维度
+        self.gc_block1 = MambaStyleGC_Block(
             input_channels=16, 
-            output_features=n*16,  # 保持与原始相同的输出维度
+            output_features=n*16,  # 与原始GC_Block相同的输出维度
             n_windows=n
         )
-        # 第二个分支：输入32通道，输出n*32个特征
-        self.gc_block2 = SimpleMambaGC_Block(
+        self.gc_block2 = MambaStyleGC_Block(
             input_channels=32, 
-            output_features=n*32,  # 保持与原始相同的输出维度
+            output_features=n*32,  # 与原始GC_Block相同的输出维度
             n_windows=n
         )
         
@@ -291,7 +277,7 @@ class EEG_DBNet_SimpleMamba(nn.Module):
         x1 = self.lc_block1(x)  # (batch, 16, time1)
         x2 = self.lc_block2(x)  # (batch, 32, time2)
         
-        # 通过极简Mamba增强的GC块
+        # 通过Mamba风格块处理
         x1 = self.gc_block1(x1)  # (batch, n*16)
         x2 = self.gc_block2(x2)  # (batch, n*32)
         

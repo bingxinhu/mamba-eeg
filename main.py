@@ -136,15 +136,15 @@ def test(model, test_loader):
 def run():
     # 配置
     dataset_path = "./dataset/2a/"
-    results_path = "./results_simple_mamba_final"
+    results_path = "./results_mamba_style"
     os.makedirs(results_path, exist_ok=True)
     
     # 超参数
     batch_size = 32
-    epochs = 100  # 进一步减少epochs用于快速验证
-    patience = 20
+    epochs = 500
+    patience = 180
     lr = 0.001
-    n_subjects = 1  # 只用1个被试测试
+    n_subjects = 1
     
     # 结果存储
     original_results = {'acc': 0, 'kappa': 0}
@@ -191,15 +191,15 @@ def run():
         original_results['acc'] = acc_original
         original_results['kappa'] = kappa_original
         
-        # 测试极简Mamba模型
-        print("\n2. Testing Simple Mamba GC_Block Model...")
-        from models import EEG_DBNet_SimpleMamba
-        model_mamba = EEG_DBNet_SimpleMamba(nb_classes=4, Chans=22, Samples=1125).to(device)
+        # 测试Mamba风格模型
+        print("\n2. Testing Mamba Style GC_Block Model...")
+        from models import EEG_DBNet_MambaStyle
+        model_mamba = EEG_DBNet_MambaStyle(nb_classes=4, Chans=22, Samples=1125).to(device)
         optimizer_mamba = optim.Adam(model_mamba.parameters(), lr=lr, weight_decay=1e-4)
         
         model_mamba_trained, history_mamba, best_acc_mamba = train(
             model_mamba, train_loader, test_loader, criterion, optimizer_mamba,
-            epochs, patience, "SimpleMamba"
+            epochs, patience, "MambaStyle"
         )
         
         acc_mamba, kappa_mamba, cf_mamba, _, _ = test(model_mamba_trained, test_loader)
@@ -208,21 +208,21 @@ def run():
         
         # 绘制学习曲线
         draw_learning_curves(history_original, f"Original_Subject_{sub+1}", results_path)
-        draw_learning_curves(history_mamba, f"SimpleMamba_Subject_{sub+1}", results_path)
+        draw_learning_curves(history_mamba, f"MambaStyle_Subject_{sub+1}", results_path)
         
         # 打印对比结果
         print(f"\n{'='*50}")
         print(f"Subject {sub+1} Comparison Results:")
         print(f"{'='*50}")
         print(f"Original GC_Block - Acc: {acc_original:.4f}, Kappa: {kappa_original:.4f}")
-        print(f"Simple Mamba    - Acc: {acc_mamba:.4f}, Kappa: {kappa_mamba:.4f}")
+        print(f"Mamba Style     - Acc: {acc_mamba:.4f}, Kappa: {kappa_mamba:.4f}")
         print(f"Improvement     - Acc: {acc_mamba-acc_original:+.4f}, Kappa: {kappa_mamba-kappa_original:+.4f}")
         
         # 保存模型
         torch.save(model_original_trained.state_dict(), 
                   f"{results_path}/original_subject_{sub+1}.pth")
         torch.save(model_mamba_trained.state_dict(), 
-                  f"{results_path}/simple_mamba_subject_{sub+1}.pth")
+                  f"{results_path}/mamba_style_subject_{sub+1}.pth")
     
     # 最终性能对比
     print(f"\n{'='*60}")
@@ -230,7 +230,7 @@ def run():
     print(f"{'='*60}")
     
     print(f"Original GC_Block - Acc: {original_results['acc']:.4f}, Kappa: {original_results['kappa']:.4f}")
-    print(f"Simple Mamba    - Acc: {mamba_results['acc']:.4f}, Kappa: {mamba_results['kappa']:.4f}")
+    print(f"Mamba Style     - Acc: {mamba_results['acc']:.4f}, Kappa: {mamba_results['kappa']:.4f}")
     print(f"Improvement     - Acc: {mamba_results['acc']-original_results['acc']:+.4f}, Kappa: {mamba_results['kappa']-original_results['kappa']:+.4f}")
     
     # 保存结果
@@ -247,10 +247,10 @@ def run():
     
     # 写入日志文件
     with open(f"{results_path}/results_summary.txt", "w") as f:
-        f.write("Simple Mamba vs Original GC_Block Comparison Results\n")
+        f.write("Mamba Style vs Original GC_Block Comparison Results\n")
         f.write("=" * 50 + "\n")
         f.write(f"Original - Acc: {original_results['acc']:.4f}, Kappa: {original_results['kappa']:.4f}\n")
-        f.write(f"Mamba    - Acc: {mamba_results['acc']:.4f}, Kappa: {mamba_results['kappa']:.4f}\n")
+        f.write(f"Mamba Style - Acc: {mamba_results['acc']:.4f}, Kappa: {mamba_results['kappa']:.4f}\n")
         f.write(f"Improvement - Acc: {results_summary['improvement_acc']:+.4f}, Kappa: {results_summary['improvement_kappa']:+.4f}\n")
 
 if __name__ == "__main__":
