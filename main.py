@@ -37,7 +37,7 @@ def draw_learning_curves(history, model_name, results_path):
     
     plt.tight_layout()
     plt.savefig(f"{results_path}/{model_name}_learning_curves.png", dpi=300)
-    plt.show()
+ #   plt.show()
     plt.close()
 
 # 训练函数
@@ -141,10 +141,10 @@ def run():
     
     # 超参数
     batch_size = 32
-    epochs = 500
+    epochs = 1000
     patience = 180
     lr = 0.001
-    n_subjects = 1
+    n_subjects = 9
     
     # 结果存储
     original_results = {'acc': 0, 'kappa': 0}
