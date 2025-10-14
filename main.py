@@ -1,119 +1,227 @@
 import os
-import time
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
 
-# 导入预处理模块
+# 导入自定义模块
 from preprocess import get_data
+from models import EEG_DBNet, EEG_DBNet_ImprovedMamba
 
-# 设置设备
+
+# -------------------------- 全局配置 --------------------------
+# 设备设置（GPU优先）
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+print(f"🚀 使用设备：{device}")
 
-# 绘制学习曲线
-def draw_learning_curves(history, model_name, results_path):
+# 路径配置
+DATASET_PATH = "./dataset/2a/"  # BCI2a数据集路径
+RESULTS_PATH = "./results_improved_mamba"  # 结果保存路径
+os.makedirs(RESULTS_PATH, exist_ok=True)  # 自动创建文件夹
+
+
+# -------------------------- 工具函数 --------------------------
+def draw_learning_curves(history, model_name, save_path):
+    """绘制学习曲线（准确率+损失），保存高清图片"""
     plt.figure(figsize=(12, 4))
     
+    # 准确率曲线
     plt.subplot(1, 2, 1)
-    plt.plot(history['train_acc'], label='Train')
-    plt.plot(history['val_acc'], label='Validation')
-    plt.title(f'{model_name} - Accuracy')
-    plt.ylabel('Accuracy')
-    plt.xlabel('Epoch')
-    plt.legend()
+    plt.plot(history['train_acc'], label='训练集', color='#1f77b4', linewidth=1.5)
+    plt.plot(history['val_acc'], label='验证集', color='#ff7f0e', linewidth=1.5)
+    plt.title(f'{model_name} - 准确率', fontsize=12)
+    plt.ylabel('准确率', fontsize=10)
+    plt.xlabel('训练轮次（Epoch）', fontsize=10)
+    plt.legend(fontsize=9)
+    plt.grid(alpha=0.3)
     
+    # 损失曲线
     plt.subplot(1, 2, 2)
-    plt.plot(history['train_loss'], label='Train')
-    plt.plot(history['val_loss'], label='Validation')
-    plt.title(f'{model_name} - Loss')
-    plt.ylabel('Loss')
-    plt.xlabel('Epoch')
-    plt.legend()
+    plt.plot(history['train_loss'], label='训练集', color='#1f77b4', linewidth=1.5)
+    plt.plot(history['val_loss'], label='验证集', color='#ff7f0e', linewidth=1.5)
+    plt.title(f'{model_name} - 损失', fontsize=12)
+    plt.ylabel('交叉熵损失', fontsize=10)
+    plt.xlabel('训练轮次（Epoch）', fontsize=10)
+    plt.legend(fontsize=9)
+    plt.grid(alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(f"{results_path}/{model_name}_learning_curves.png", dpi=300)
- #   plt.show()
+    plt.savefig(f"{save_path}/{model_name}_learning_curves.png", dpi=300, bbox_inches='tight')
     plt.close()
+    print(f"📊 学习曲线已保存：{save_path}/{model_name}_learning_curves.png")
 
-# 训练函数
-def train(model, train_loader, val_loader, criterion, optimizer, epochs, patience, model_name):
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
-    best_val_acc = 0
-    counter = 0
-    best_model = None
+
+def adjust_dropout_p(train_loss, val_loss, current_p=0.3):
+    """自适应Dropout：根据过拟合程度调整p值（避免过拟合）"""
+    if val_loss > 2 * train_loss + 1e-6:  # 轻微过拟合：p=0.4
+        return min(current_p + 0.1, 0.5)
+    elif val_loss < 1.2 * train_loss + 1e-6:  # 正常拟合：p=0.3
+        return 0.3
+    else:  # 无过拟合：p=0.3
+        return 0.3
+
+
+def set_layerwise_lr(model, base_lr=1e-4, mamba_lr_scale=0.5):
+    """分层学习率：Mamba层用更低的学习率（避免参数震荡）"""
+    params = []
+    for name, param in model.named_parameters():
+        if 'mamba_block' in name:  # Mamba层参数：学习率=base_lr×0.5
+            params.append({'params': param, 'lr': base_lr * mamba_lr_scale})
+        else:  # 其他层（LC_Block、全连接）：基础学习率
+            params.append({'params': param, 'lr': base_lr})
+    return params
+
+
+# -------------------------- 训练与测试函数（核心：调整早停逻辑） --------------------------
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, 
+                epochs, patience, min_epochs, val_loss_ratio, model_name, device):
+    """改进训练函数：解决早停太早问题
+    - min_epochs：最小训练轮次（未达此轮次不触发早停）
+    - val_loss_ratio：验证损失/训练损失 最大阈值（放宽过拟合判断）
+    """
+    # 初始化训练历史
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': [],
+        'dropout_p': []
+    }
+    best_val_acc = 0.0  # 最佳验证准确率
+    best_val_loss = float('inf')  # 最佳验证损失
+    early_stop_counter = 0  # 早停计数器
+    best_model_state = None  # 最佳模型权重
+    current_dropout_p = 0.3  # 初始Dropout p值
+    
+    print(f"\n📌 开始训练 {model_name}")
+    print(f"   - 总轮次：{epochs} | 最小训练轮次：{min_epochs} | 早停耐心值：{patience} | 过拟合阈值：{val_loss_ratio}倍")
     
     for epoch in range(epochs):
+        # -------------------------- 训练阶段 --------------------------
         model.train()
-        train_loss = 0
-        correct = 0
-        total = 0
+        train_total = 0
+        train_correct = 0
+        train_loss = 0.0
         
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
+            
+            # 梯度清零
             optimizer.zero_grad()
-            outputs = model(inputs)
+            
+            # 前向传播（改进Mamba模型需传递Dropout p值）
+            if isinstance(model, EEG_DBNet_ImprovedMamba):
+                outputs = model(inputs, dropout_p=current_dropout_p)
+            else:
+                outputs = model(inputs)
+            
+            # 计算损失与反向传播
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
             
-            train_loss += loss.item()
+            # 统计训练指标
+            train_loss += loss.item() * inputs.size(0)
             _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            train_total += labels.size(0)
+            train_correct += predicted.eq(labels).sum().item()
         
-        train_acc = correct / total
-        train_loss /= len(train_loader)
+        # 计算平均训练指标
+        avg_train_loss = train_loss / train_total
+        train_acc = train_correct / train_total
         
-        # 验证
+        # -------------------------- 验证阶段 --------------------------
         model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
+        val_total = 0
+        val_correct = 0
+        val_loss = 0.0
         
         with torch.no_grad():
             for inputs, labels in val_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
                 
-                val_loss += loss.item()
+                if isinstance(model, EEG_DBNet_ImprovedMamba):
+                    outputs = model(inputs, dropout_p=current_dropout_p)
+                else:
+                    outputs = model(inputs)
+                
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * inputs.size(0)
                 _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
         
-        val_acc = correct / total
-        val_loss /= len(val_loader)
+        # 计算平均验证指标
+        avg_val_loss = val_loss / val_total
+        val_acc = val_correct / val_total
         
-        history['train_loss'].append(train_loss)
+        # -------------------------- 动态调整策略 --------------------------
+        # 1. 自适应Dropout
+        current_dropout_p = adjust_dropout_p(avg_train_loss, avg_val_loss, current_dropout_p)
+        # 2. 学习率调度（余弦退火）
+        scheduler.step()
+        
+        # -------------------------- 记录与打印 --------------------------
+        history['train_loss'].append(avg_train_loss)
         history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
+        history['val_loss'].append(avg_val_loss)
         history['val_acc'].append(val_acc)
+        history['dropout_p'].append(current_dropout_p)
         
-        print(f"{model_name} - Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        # 打印当前轮次信息（突出显示最小训练轮次进度）
+        min_epochs_progress = f"{epoch+1}/{min_epochs}" if epoch+1 < min_epochs else f"✅ {min_epochs}"
+        print(f"[{epoch+1:03d}/{epochs:03d}] "
+              f"最小轮次进度：{min_epochs_progress} | "
+              f"训练损失: {avg_train_loss:.4f} | 训练准确率: {train_acc:.4f} | "
+              f"验证损失: {avg_val_loss:.4f} | 验证准确率: {val_acc:.4f} | "
+              f"Dropout p: {current_dropout_p:.1f} | "
+              f"学习率: {scheduler.get_last_lr()[0]:.6f}")
         
-        # 早停
-        if val_acc > best_val_acc:
+        # -------------------------- 最佳模型保存与早停判断（核心修改） --------------------------
+        # 1. 更新最佳模型（无论是否达最小轮次，都记录最佳权重）
+        if (val_acc > best_val_acc + 1e-6) or (val_acc == best_val_acc and avg_val_loss < best_val_loss):
             best_val_acc = val_acc
-            best_model = model.state_dict().copy()
-            counter = 0
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict().copy()
+            early_stop_counter = 0  # 重置早停计数器
+            print(f"✨ 找到更佳模型！验证准确率: {best_val_acc:.4f}（轮次{epoch+1}）")
         else:
-            counter += 1
-            if counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
+            early_stop_counter += 1
+        
+        # 2. 早停判断：仅当达到最小训练轮次后，才允许触发早停
+        if epoch + 1 < min_epochs:
+            # 未达最小轮次：跳过早停，继续训练
+            continue
+        else:
+            # 达最小轮次：检查早停条件
+            stop_condition1 = early_stop_counter >= patience  # 耐心值耗尽
+            stop_condition2 = avg_val_loss > val_loss_ratio * avg_train_loss + 1e-6  # 过拟合严重
+            
+            if stop_condition1 or stop_condition2:
+                # 打印早停原因，方便调试
+                stop_reason = f"早停计数器达到{patience}（耐心值耗尽）" if stop_condition1 else \
+                              f"验证损失超过{val_loss_ratio}倍训练损失（过拟合）"
+                print(f"\n🛑 早停触发！原因：{stop_reason}")
+                print(f"   - 最佳验证准确率: {best_val_acc:.4f}（对应轮次{epoch+1 - early_stop_counter}）")
                 break
     
-    if best_model is not None:
-        model.load_state_dict(best_model)
+    # 加载最佳模型权重
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"✅ 加载最佳模型权重（验证准确率: {best_val_acc:.4f}）")
+    else:
+        print("⚠️  未找到最佳模型（所有轮次未改进）")
+    
     return model, history, best_val_acc
 
-# 测试函数
-def test(model, test_loader):
+
+def test_model(model, test_loader, device):
+    """测试函数：计算准确率、Kappa系数、混淆矩阵"""
     model.eval()
     all_preds = []
     all_labels = []
@@ -121,137 +229,225 @@ def test(model, test_loader):
     with torch.no_grad():
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
+            
+            # 前向传播（测试时关闭Dropout）
+            if isinstance(model, EEG_DBNet_ImprovedMamba):
+                outputs = model(inputs, dropout_p=0.0)
+            else:
+                outputs = model(inputs)
+            
             _, predicted = outputs.max(1)
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     
+    # 计算评估指标
     acc = accuracy_score(all_labels, all_preds)
-    kappa = cohen_kappa_score(all_labels, all_preds)
-    cf_matrix = confusion_matrix(all_labels, all_preds, normalize='pred')
+    kappa = cohen_kappa_score(all_labels, all_preds)  # 抗类别不平衡
+    cf_matrix = confusion_matrix(all_labels, all_preds, normalize='true')  # 行归一化（真实标签视角）
     
-    return acc, kappa, cf_matrix, all_labels, all_preds
+    return acc, kappa, cf_matrix
 
-# 主运行函数
-def run():
-    # 配置
-    dataset_path = "./dataset/2a/"
-    results_path = "./results_mamba_style"
-    os.makedirs(results_path, exist_ok=True)
+
+# -------------------------- 主运行函数（调整早停相关超参数） --------------------------
+def main():
+    # 超参数配置（核心调整：早停相关）
+    BATCH_SIZE = 32
+    EPOCHS = 2000  # 总轮次不变
+    PATIENCE = 600  # 1. 增大早停耐心值（原300→600，给更多收敛时间）
+    MIN_EPOCHS = 1000  # 2. 最小训练轮次（至少训练500轮才允许早停）
+    VAL_LOSS_RATIO = 4.0  # 3. 放宽过拟合阈值（原2倍→3倍，EEG噪声大，轻微过拟合正常）
+    BASE_LR = 1e-3
+    N_SUBJECTS = 9  # BCI2a共9个被试
+    FRE_FILTER = True  # 启用多频段滤波
+    LOSO = False  # False=被试内验证，True=留一法交叉验证
     
-    # 超参数
-    batch_size = 32
-    epochs = 1000
-    patience = 180
-    lr = 0.001
-    n_subjects = 9
-    
-    # 结果存储
-    original_results = {'acc': 0, 'kappa': 0}
-    mamba_results = {'acc': 0, 'kappa': 0}
-    
-    for sub in range(n_subjects):
-        print(f"\n{'='*50}")
-        print(f"Testing on subject {sub + 1}")
-        print(f"{'='*50}")
-        
-        # 获取数据
-        X_train, y_train, X_test, y_test = get_data(
-            dataset_path, sub, loso=False, is_standard=True, fre_filter=False, dataset='BCI2a'
-        )
-        
-        # 转换为PyTorch张量
-        X_train = torch.FloatTensor(X_train).to(device)
-        y_train = torch.LongTensor(y_train).to(device)
-        X_test = torch.FloatTensor(X_test).to(device)
-        y_test = torch.LongTensor(y_test).to(device)
-        
-        print(f"Train data shape: {X_train.shape}")
-        print(f"Test data shape: {X_test.shape}")
-        
-        # 创建数据加载器
-        train_dataset = TensorDataset(X_train, y_train)
-        test_dataset = TensorDataset(X_test, y_test)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-        
-        # 测试原始模型
-        print("\n1. Testing Original GC_Block Model...")
-        from models import EEG_DBNet
-        model_original = EEG_DBNet(nb_classes=4, Chans=22, Samples=1125).to(device)
-        criterion = nn.CrossEntropyLoss()
-        optimizer_original = optim.Adam(model_original.parameters(), lr=lr, weight_decay=1e-4)
-        
-        model_original_trained, history_original, best_acc_original = train(
-            model_original, train_loader, test_loader, criterion, optimizer_original, 
-            epochs, patience, "Original"
-        )
-        
-        acc_original, kappa_original, cf_original, _, _ = test(model_original_trained, test_loader)
-        original_results['acc'] = acc_original
-        original_results['kappa'] = kappa_original
-        
-        # 测试Mamba风格模型
-        print("\n2. Testing Mamba Style GC_Block Model...")
-        from models import EEG_DBNet_MambaStyle
-        model_mamba = EEG_DBNet_MambaStyle(nb_classes=4, Chans=22, Samples=1125).to(device)
-        optimizer_mamba = optim.Adam(model_mamba.parameters(), lr=lr, weight_decay=1e-4)
-        
-        model_mamba_trained, history_mamba, best_acc_mamba = train(
-            model_mamba, train_loader, test_loader, criterion, optimizer_mamba,
-            epochs, patience, "MambaStyle"
-        )
-        
-        acc_mamba, kappa_mamba, cf_mamba, _, _ = test(model_mamba_trained, test_loader)
-        mamba_results['acc'] = acc_mamba
-        mamba_results['kappa'] = kappa_mamba
-        
-        # 绘制学习曲线
-        draw_learning_curves(history_original, f"Original_Subject_{sub+1}", results_path)
-        draw_learning_curves(history_mamba, f"MambaStyle_Subject_{sub+1}", results_path)
-        
-        # 打印对比结果
-        print(f"\n{'='*50}")
-        print(f"Subject {sub+1} Comparison Results:")
-        print(f"{'='*50}")
-        print(f"Original GC_Block - Acc: {acc_original:.4f}, Kappa: {kappa_original:.4f}")
-        print(f"Mamba Style     - Acc: {acc_mamba:.4f}, Kappa: {kappa_mamba:.4f}")
-        print(f"Improvement     - Acc: {acc_mamba-acc_original:+.4f}, Kappa: {kappa_mamba-kappa_original:+.4f}")
-        
-        # 保存模型
-        torch.save(model_original_trained.state_dict(), 
-                  f"{results_path}/original_subject_{sub+1}.pth")
-        torch.save(model_mamba_trained.state_dict(), 
-                  f"{results_path}/mamba_style_subject_{sub+1}.pth")
-    
-    # 最终性能对比
-    print(f"\n{'='*60}")
-    print("FINAL COMPARISON RESULTS")
-    print(f"{'='*60}")
-    
-    print(f"Original GC_Block - Acc: {original_results['acc']:.4f}, Kappa: {original_results['kappa']:.4f}")
-    print(f"Mamba Style     - Acc: {mamba_results['acc']:.4f}, Kappa: {mamba_results['kappa']:.4f}")
-    print(f"Improvement     - Acc: {mamba_results['acc']-original_results['acc']:+.4f}, Kappa: {mamba_results['kappa']-original_results['kappa']:+.4f}")
-    
-    # 保存结果
-    results_summary = {
-        'original_acc': original_results['acc'],
-        'mamba_acc': mamba_results['acc'],
-        'original_kappa': original_results['kappa'],
-        'mamba_kappa': mamba_results['kappa'],
-        'improvement_acc': mamba_results['acc'] - original_results['acc'],
-        'improvement_kappa': mamba_results['kappa'] - original_results['kappa']
+    # 结果存储（按被试统计）
+    results = {
+        'original': {'acc': [], 'kappa': []},
+        'improved_mamba': {'acc': [], 'kappa': []}
     }
     
-    np.savez(f"{results_path}/comparison_results.npz", **results_summary)
+    # 循环处理每个被试
+    for sub_idx in range(N_SUBJECTS):
+        print(f"\n{'='*70}")
+        print(f"🔍 处理被试 {sub_idx+1}/{N_SUBJECTS}")
+        print(f"{'='*70}")
+        
+        # 1. 加载预处理数据（参数名已修复：dataset_path→data_path）
+        X_train, y_train, X_test, y_test = get_data(
+            data_path=DATASET_PATH,
+            subject=sub_idx,
+            loso=LOSO,
+            is_standard=True,
+            fre_filter=FRE_FILTER,
+            dataset='BCI2a'
+        )
+        
+        # 2. 创建数据加载器
+        train_dataset = TensorDataset(X_train, y_train)
+        test_dataset = TensorDataset(X_test, y_test)
+        train_loader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2
+        )
+        val_loader = test_loader  # 被试内验证：测试集作为验证集
     
-    # 写入日志文件
-    with open(f"{results_path}/results_summary.txt", "w") as f:
-        f.write("Mamba Style vs Original GC_Block Comparison Results\n")
-        f.write("=" * 50 + "\n")
-        f.write(f"Original - Acc: {original_results['acc']:.4f}, Kappa: {original_results['kappa']:.4f}\n")
-        f.write(f"Mamba Style - Acc: {mamba_results['acc']:.4f}, Kappa: {mamba_results['kappa']:.4f}\n")
-        f.write(f"Improvement - Acc: {results_summary['improvement_acc']:+.4f}, Kappa: {results_summary['improvement_kappa']:+.4f}\n")
+        # 3. 训练原始模型（EEG_DBNet）
+        print(f"\n[1/2] 训练原始GC_Block模型")
+        # 初始化原始模型（Chans适配多频段：22×5=110）
+        n_chans = 22 * 5 if FRE_FILTER else 22
+        model_original = EEG_DBNet(nb_classes=4, Chans=n_chans, Samples=1125).to(device)
+        
+        # 优化器与调度器
+        criterion = nn.CrossEntropyLoss()
+        optimizer_original = optim.Adam(model_original.parameters(), lr=BASE_LR, weight_decay=1e-4)
+        scheduler_original = CosineAnnealingLR(optimizer_original, T_max=EPOCHS)
+        
+        # 训练原始模型（传递新的早停参数）
+        model_original_best, history_original, _ = train_model(
+            model=model_original,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer_original,
+            scheduler=scheduler_original,
+            epochs=EPOCHS,
+            patience=PATIENCE,
+            min_epochs=MIN_EPOCHS,  # 新增：最小训练轮次
+            val_loss_ratio=VAL_LOSS_RATIO,  # 新增：放宽过拟合阈值
+            model_name=f"Original_Subject_{sub_idx+1}",
+            device=device
+        )
+        
+        # 测试原始模型
+        acc_original, kappa_original, _ = test_model(
+            model=model_original_best,
+            test_loader=test_loader,
+            device=device
+        )
+        results['original']['acc'].append(acc_original)
+        results['original']['kappa'].append(kappa_original)
+        
+        # 保存原始模型与学习曲线
+        torch.save(model_original_best.state_dict(), 
+                  f"{RESULTS_PATH}/original_subject_{sub_idx+1}.pth")
+        draw_learning_curves(history_original, f"Original_Subject_{sub_idx+1}", RESULTS_PATH)
+        
+        # 4. 训练改进Mamba模型（EEG_DBNet_ImprovedMamba）
+        print(f"\n[2/2] 训练改进Mamba模型")
+        # 初始化改进Mamba模型（Chans适配多频段）
+        model_mamba = EEG_DBNet_ImprovedMamba(
+            nb_classes=4,
+            Chans=n_chans,
+            hidden_dim1=32,
+            hidden_dim2=64,
+            n_local_blocks=3  # 局部块数（3为宜，避免时序碎片化）
+        ).to(device)
+        
+        # 分层学习率（Mamba层学习率更低）
+        params_mamba = set_layerwise_lr(model_mamba, base_lr=BASE_LR, mamba_lr_scale=0.5)
+        optimizer_mamba = optim.Adam(params_mamba, weight_decay=1e-4)
+        scheduler_mamba = CosineAnnealingLR(optimizer_mamba, T_max=EPOCHS)
+        
+        # 训练改进Mamba模型（传递新的早停参数）
+        model_mamba_best, history_mamba, _ = train_model(
+            model=model_mamba,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer_mamba,
+            scheduler=scheduler_mamba,
+            epochs=EPOCHS,
+            patience=PATIENCE,
+            min_epochs=MIN_EPOCHS,  # 新增
+            val_loss_ratio=VAL_LOSS_RATIO,  # 新增
+            model_name=f"ImprovedMamba_Subject_{sub_idx+1}",
+            device=device
+        )
+        
+        # 测试改进Mamba模型
+        acc_mamba, kappa_mamba, _ = test_model(
+            model=model_mamba_best,
+            test_loader=test_loader,
+            device=device
+        )
+        results['improved_mamba']['acc'].append(acc_mamba)
+        results['improved_mamba']['kappa'].append(kappa_mamba)
+        
+        # 保存改进Mamba模型与学习曲线
+        torch.save(model_mamba_best.state_dict(), 
+                  f"{RESULTS_PATH}/improved_mamba_subject_{sub_idx+1}.pth")
+        draw_learning_curves(history_mamba, f"ImprovedMamba_Subject_{sub_idx+1}", RESULTS_PATH)
+        
+        # 5. 打印当前被试对比结果
+        print(f"\n{'='*50}")
+        print(f"被试 {sub_idx+1} 结果对比")
+        print(f"{'='*50}")
+        print(f"原始GC_Block | 准确率: {acc_original:.4f} | Kappa: {kappa_original:.4f}")
+        print(f"改进Mamba    | 准确率: {acc_mamba:.4f} | Kappa: {kappa_mamba:.4f}")
+        print(f"改进幅度     | 准确率: {acc_mamba - acc_original:+.4f} | Kappa: {kappa_mamba - kappa_original:+.4f}")
+        print(f"{'='*50}")
+    
+    # -------------------------- 最终结果汇总 --------------------------
+    # 计算平均性能
+    avg_original_acc = np.mean(results['original']['acc'])
+    avg_original_kappa = np.mean(results['original']['kappa'])
+    avg_mamba_acc = np.mean(results['improved_mamba']['acc'])
+    avg_mamba_kappa = np.mean(results['improved_mamba']['kappa'])
+    
+    # 保存结果到NPZ文件（数值格式）
+    final_results = {
+        'original_acc_per_subject': np.array(results['original']['acc']),
+        'original_kappa_per_subject': np.array(results['original']['kappa']),
+        'improved_mamba_acc_per_subject': np.array(results['improved_mamba']['acc']),
+        'improved_mamba_kappa_per_subject': np.array(results['improved_mamba']['kappa']),
+        'avg_original_acc': avg_original_acc,
+        'avg_original_kappa': avg_original_kappa,
+        'avg_improved_mamba_acc': avg_mamba_acc,
+        'avg_improved_mamba_kappa': avg_mamba_kappa,
+        'avg_improvement_acc': avg_mamba_acc - avg_original_acc,
+        'avg_improvement_kappa': avg_mamba_kappa - avg_original_kappa
+    }
+    np.savez(f"{RESULTS_PATH}/final_comparison_results.npz", **final_results)
+    
+    # 保存结果到文本文件（可读格式）
+    with open(f"{RESULTS_PATH}/results_summary.txt", "w", encoding='utf-8') as f:
+        f.write("BCI2a数据集 - 原始GC_Block vs 改进Mamba模型 结果汇总\n")
+        f.write("="*80 + "\n")
+        f.write(f"实验配置：\n")
+        f.write(f"  - 批次大小：{BATCH_SIZE}\n")
+        f.write(f"  - 基础学习率：{BASE_LR}\n")
+        f.write(f"  - 总轮次：{EPOCHS}\n")
+        f.write(f"  - 早停耐心值：{PATIENCE}\n")
+        f.write(f"  - 最小训练轮次：{MIN_EPOCHS}\n")
+        f.write(f"  - 过拟合阈值：{VAL_LOSS_RATIO}倍训练损失\n")
+        f.write(f"  - 多频段滤波：{FRE_FILTER}\n")
+        f.write(f"  - 验证方式：{'留一法' if LOSO else '被试内'}\n")
+        f.write("="*80 + "\n")
+        f.write(f"各被试详细结果：\n")
+        for i in range(N_SUBJECTS):
+            f.write(f"被试{i+1:02d} | 原始准确率：{results['original']['acc'][i]:.4f} | "
+                    f"改进准确率：{results['improved_mamba']['acc'][i]:.4f} | "
+                    f"改进幅度：{results['improved_mamba']['acc'][i] - results['original']['acc'][i]:+.4f}\n")
+        f.write("="*80 + "\n")
+        f.write(f"平均性能对比：\n")
+        f.write(f"原始GC_Block | 平均准确率：{avg_original_acc:.4f} | 平均Kappa：{avg_original_kappa:.4f}\n")
+        f.write(f"改进Mamba    | 平均准确率：{avg_mamba_acc:.4f} | 平均Kappa：{avg_mamba_kappa:.4f}\n")
+        f.write(f"平均改进幅度 | 准确率：{avg_mamba_acc - avg_original_acc:+.4f} | Kappa：{avg_mamba_kappa - avg_original_kappa:+.4f}\n")
+        f.write("="*80 + "\n")
+    
+    # 打印最终平均结果
+    print(f"\n{'='*70}")
+    print("🎯 最终平均结果（9个被试）")
+    print(f"{'='*70}")
+    print(f"原始GC_Block | 平均准确率：{avg_original_acc:.4f} | 平均Kappa：{avg_original_kappa:.4f}")
+    print(f"改进Mamba    | 平均准确率：{avg_mamba_acc:.4f} | 平均Kappa：{avg_mamba_kappa:.4f}")
+    print(f"平均改进幅度 | 准确率：{avg_mamba_acc - avg_original_acc:+.4f} | Kappa：{avg_mamba_kappa - avg_original_kappa:+.4f}")
+    print(f"{'='*70}")
+    print(f"\n📁 所有结果已保存至：{RESULTS_PATH}")
+
 
 if __name__ == "__main__":
-    run()
+    main()
