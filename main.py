@@ -13,7 +13,7 @@ from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
 
 # 导入自定义模块
 from preprocess import get_data
-from models import EEG_DBNet, EEG_DBNet_ImprovedMamba
+from models import EEG_DBNet, EEG_DBNet_ImprovedMamba, EEG_DBNet_NAS
 
 
 # -------------------------- 全局配置 --------------------------
@@ -23,7 +23,7 @@ print(f"🚀 使用设备：{device}")
 
 # 路径配置
 DATASET_PATH = "./dataset/2a/"  # BCI2a数据集路径
-RESULTS_PATH = "./results_improved_mamba"  # 结果保存路径
+RESULTS_PATH = "./results_nas_mamba"  # 结果保存路径
 os.makedirs(RESULTS_PATH, exist_ok=True)  # 自动创建文件夹
 
 
@@ -56,6 +56,46 @@ def draw_learning_curves(history, model_name, save_path):
     plt.savefig(f"{save_path}/{model_name}_learning_curves.png", dpi=300, bbox_inches='tight')
     plt.close()
     print(f"📊 学习曲线已保存：{save_path}/{model_name}_learning_curves.png")
+
+
+def draw_nas_weights_heatmap(nas_weights_all_subjects, save_path):
+    """绘制所有被试的NAS权重热力图"""
+    if not nas_weights_all_subjects:
+        return
+    
+    plt.figure(figsize=(15, 8))
+    
+    # 提取所有被试的权重
+    n_subjects = len(nas_weights_all_subjects)
+    n_ops = len(nas_weights_all_subjects[0]['lc_block1'])
+    
+    # 创建权重矩阵
+    weights_lc1 = np.zeros((n_subjects, n_ops))
+    weights_lc2 = np.zeros((n_subjects, n_ops))
+    
+    for i, weights in enumerate(nas_weights_all_subjects):
+        weights_lc1[i] = weights['lc_block1']
+        weights_lc2[i] = weights['lc_block2']
+    
+    # 绘制热力图
+    plt.subplot(1, 2, 1)
+    im1 = plt.imshow(weights_lc1, cmap='YlOrRd', aspect='auto')
+    plt.title('LC_Block1 NAS权重分布', fontsize=12)
+    plt.xlabel('操作索引', fontsize=10)
+    plt.ylabel('被试编号', fontsize=10)
+    plt.colorbar(im1)
+    
+    plt.subplot(1, 2, 2)
+    im2 = plt.imshow(weights_lc2, cmap='YlOrRd', aspect='auto')
+    plt.title('LC_Block2 NAS权重分布', fontsize=12)
+    plt.xlabel('操作索引', fontsize=10)
+    plt.ylabel('被试编号', fontsize=10)
+    plt.colorbar(im2)
+    
+    plt.tight_layout()
+    plt.savefig(f"{save_path}/nas_weights_heatmap.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"📊 NAS权重热力图已保存：{save_path}/nas_weights_heatmap.png")
 
 
 def adjust_dropout_p(train_loss, val_loss, current_p=0.3):
@@ -115,7 +155,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             optimizer.zero_grad()
             
             # 前向传播（改进Mamba模型需传递Dropout p值）
-            if isinstance(model, EEG_DBNet_ImprovedMamba):
+            if hasattr(model, 'use_nas') or hasattr(model, 'fc_initialized'):
                 outputs = model(inputs, dropout_p=current_dropout_p)
             else:
                 outputs = model(inputs)
@@ -145,7 +185,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             for inputs, labels in val_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 
-                if isinstance(model, EEG_DBNet_ImprovedMamba):
+                if hasattr(model, 'use_nas') or hasattr(model, 'fc_initialized'):
                     outputs = model(inputs, dropout_p=current_dropout_p)
                 else:
                     outputs = model(inputs)
@@ -231,7 +271,7 @@ def test_model(model, test_loader, device):
             inputs, labels = inputs.to(device), labels.to(device)
             
             # 前向传播（测试时关闭Dropout）
-            if isinstance(model, EEG_DBNet_ImprovedMamba):
+            if hasattr(model, 'use_nas') or hasattr(model, 'fc_initialized'):
                 outputs = model(inputs, dropout_p=0.0)
             else:
                 outputs = model(inputs)
@@ -248,7 +288,7 @@ def test_model(model, test_loader, device):
     return acc, kappa, cf_matrix
 
 
-# -------------------------- 主运行函数（调整早停相关超参数） --------------------------
+# -------------------------- 主运行函数（集成NAS架构） --------------------------
 def main():
     # 超参数配置（核心调整：早停相关）
     BATCH_SIZE = 32
@@ -261,11 +301,20 @@ def main():
     FRE_FILTER = True  # 启用多频段滤波
     LOSO = False  # False=被试内验证，True=留一法交叉验证
     
+    # NAS配置
+    USE_NAS = True  # 是否使用NAS架构
+    NAS_ONLY = False  # 是否使用纯NAS模型（不包含Mamba）
+    
+    print(f"🧠 NAS架构配置：USE_NAS={USE_NAS}, NAS_ONLY={NAS_ONLY}")
+    
     # 结果存储（按被试统计）
     results = {
         'original': {'acc': [], 'kappa': []},
         'improved_mamba': {'acc': [], 'kappa': []}
     }
+    
+    # NAS权重存储（用于分析）
+    nas_weights_all_subjects = []
     
     # 循环处理每个被试
     for sub_idx in range(N_SUBJECTS):
@@ -273,7 +322,7 @@ def main():
         print(f"🔍 处理被试 {sub_idx+1}/{N_SUBJECTS}")
         print(f"{'='*70}")
         
-        # 1. 加载预处理数据（参数名已修复：dataset_path→data_path）
+        # 1. 加载预处理数据
         X_train, y_train, X_test, y_test = get_data(
             data_path=DATASET_PATH,
             subject=sub_idx,
@@ -305,7 +354,7 @@ def main():
         optimizer_original = optim.Adam(model_original.parameters(), lr=BASE_LR, weight_decay=1e-4)
         scheduler_original = CosineAnnealingLR(optimizer_original, T_max=EPOCHS)
         
-        # 训练原始模型（传递新的早停参数）
+        # 训练原始模型
         model_original_best, history_original, _ = train_model(
             model=model_original,
             train_loader=train_loader,
@@ -315,8 +364,8 @@ def main():
             scheduler=scheduler_original,
             epochs=EPOCHS,
             patience=PATIENCE,
-            min_epochs=MIN_EPOCHS,  # 新增：最小训练轮次
-            val_loss_ratio=VAL_LOSS_RATIO,  # 新增：放宽过拟合阈值
+            min_epochs=MIN_EPOCHS,
+            val_loss_ratio=VAL_LOSS_RATIO,
             model_name=f"Original_Subject_{sub_idx+1}",
             device=device
         )
@@ -335,23 +384,38 @@ def main():
                   f"{RESULTS_PATH}/original_subject_{sub_idx+1}.pth")
         draw_learning_curves(history_original, f"Original_Subject_{sub_idx+1}", RESULTS_PATH)
         
-        # 4. 训练改进Mamba模型（EEG_DBNet_ImprovedMamba）
-        print(f"\n[2/2] 训练改进Mamba模型")
-        # 初始化改进Mamba模型（Chans适配多频段）
-        model_mamba = EEG_DBNet_ImprovedMamba(
-            nb_classes=4,
-            Chans=n_chans,
-            hidden_dim1=32,
-            hidden_dim2=64,
-            n_local_blocks=3  # 局部块数（3为宜，避免时序碎片化）
-        ).to(device)
+        # 4. 训练改进模型（根据配置选择NAS或Mamba）
+        if NAS_ONLY:
+            print(f"\n[2/2] 训练纯NAS模型")
+            model_mamba = EEG_DBNet_NAS(
+                nb_classes=4,
+                Chans=n_chans,
+                hidden_dim1=32,
+                hidden_dim2=64
+            ).to(device)
+            model_suffix = "NAS"
+        else:
+            print(f"\n[2/2] 训练改进Mamba模型{'（NAS架构）' if USE_NAS else ''}")
+            model_mamba = EEG_DBNet_ImprovedMamba(
+                nb_classes=4,
+                Chans=n_chans,
+                hidden_dim1=32,
+                hidden_dim2=64,
+                n_local_blocks=3,
+                use_nas=USE_NAS
+            ).to(device)
+            model_suffix = "ImprovedMamba_NAS" if USE_NAS else "ImprovedMamba"
         
         # 分层学习率（Mamba层学习率更低）
-        params_mamba = set_layerwise_lr(model_mamba, base_lr=BASE_LR, mamba_lr_scale=0.5)
-        optimizer_mamba = optim.Adam(params_mamba, weight_decay=1e-4)
+        if not NAS_ONLY:
+            params_mamba = set_layerwise_lr(model_mamba, base_lr=BASE_LR, mamba_lr_scale=0.5)
+            optimizer_mamba = optim.Adam(params_mamba, weight_decay=1e-4)
+        else:
+            optimizer_mamba = optim.Adam(model_mamba.parameters(), lr=BASE_LR, weight_decay=1e-4)
+            
         scheduler_mamba = CosineAnnealingLR(optimizer_mamba, T_max=EPOCHS)
         
-        # 训练改进Mamba模型（传递新的早停参数）
+        # 训练改进模型
         model_mamba_best, history_mamba, _ = train_model(
             model=model_mamba,
             train_loader=train_loader,
@@ -361,13 +425,13 @@ def main():
             scheduler=scheduler_mamba,
             epochs=EPOCHS,
             patience=PATIENCE,
-            min_epochs=MIN_EPOCHS,  # 新增
-            val_loss_ratio=VAL_LOSS_RATIO,  # 新增
-            model_name=f"ImprovedMamba_Subject_{sub_idx+1}",
+            min_epochs=MIN_EPOCHS,
+            val_loss_ratio=VAL_LOSS_RATIO,
+            model_name=f"{model_suffix}_Subject_{sub_idx+1}",
             device=device
         )
         
-        # 测试改进Mamba模型
+        # 测试改进模型
         acc_mamba, kappa_mamba, _ = test_model(
             model=model_mamba_best,
             test_loader=test_loader,
@@ -376,17 +440,26 @@ def main():
         results['improved_mamba']['acc'].append(acc_mamba)
         results['improved_mamba']['kappa'].append(kappa_mamba)
         
-        # 保存改进Mamba模型与学习曲线
+        # 保存改进模型与学习曲线
         torch.save(model_mamba_best.state_dict(), 
-                  f"{RESULTS_PATH}/improved_mamba_subject_{sub_idx+1}.pth")
-        draw_learning_curves(history_mamba, f"ImprovedMamba_Subject_{sub_idx+1}", RESULTS_PATH)
+                  f"{RESULTS_PATH}/{model_suffix.lower()}_subject_{sub_idx+1}.pth")
+        draw_learning_curves(history_mamba, f"{model_suffix}_Subject_{sub_idx+1}", RESULTS_PATH)
         
-        # 5. 打印当前被试对比结果
+        # 5. 收集NAS权重（如果使用NAS）
+        if USE_NAS and not NAS_ONLY:
+            nas_weights = model_mamba_best.get_nas_weights()
+            if nas_weights is not None:
+                nas_weights_all_subjects.append(nas_weights)
+                print(f"📊 被试{sub_idx+1} NAS架构权重：")
+                print(f"   - LC_Block1: {nas_weights['lc_block1']}")
+                print(f"   - LC_Block2: {nas_weights['lc_block2']}")
+        
+        # 6. 打印当前被试对比结果
         print(f"\n{'='*50}")
         print(f"被试 {sub_idx+1} 结果对比")
         print(f"{'='*50}")
         print(f"原始GC_Block | 准确率: {acc_original:.4f} | Kappa: {kappa_original:.4f}")
-        print(f"改进Mamba    | 准确率: {acc_mamba:.4f} | Kappa: {kappa_mamba:.4f}")
+        print(f"{model_suffix:11} | 准确率: {acc_mamba:.4f} | Kappa: {kappa_mamba:.4f}")
         print(f"改进幅度     | 准确率: {acc_mamba - acc_original:+.4f} | Kappa: {kappa_mamba - kappa_original:+.4f}")
         print(f"{'='*50}")
     
@@ -396,6 +469,10 @@ def main():
     avg_original_kappa = np.mean(results['original']['kappa'])
     avg_mamba_acc = np.mean(results['improved_mamba']['acc'])
     avg_mamba_kappa = np.mean(results['improved_mamba']['kappa'])
+    
+    # 绘制NAS权重热力图
+    if nas_weights_all_subjects:
+        draw_nas_weights_heatmap(nas_weights_all_subjects, RESULTS_PATH)
     
     # 保存结果到NPZ文件（数值格式）
     final_results = {
@@ -408,13 +485,16 @@ def main():
         'avg_improved_mamba_acc': avg_mamba_acc,
         'avg_improved_mamba_kappa': avg_mamba_kappa,
         'avg_improvement_acc': avg_mamba_acc - avg_original_acc,
-        'avg_improvement_kappa': avg_mamba_kappa - avg_original_kappa
+        'avg_improvement_kappa': avg_mamba_kappa - avg_original_kappa,
+        'nas_weights': np.array([w['lc_block1'] for w in nas_weights_all_subjects]) if nas_weights_all_subjects else None
     }
     np.savez(f"{RESULTS_PATH}/final_comparison_results.npz", **final_results)
     
     # 保存结果到文本文件（可读格式）
+    model_type = "纯NAS模型" if NAS_ONLY else f"改进Mamba模型{'（NAS架构）' if USE_NAS else ''}"
+    
     with open(f"{RESULTS_PATH}/results_summary.txt", "w", encoding='utf-8') as f:
-        f.write("BCI2a数据集 - 原始GC_Block vs 改进Mamba模型 结果汇总\n")
+        f.write("BCI2a数据集 - 原始GC_Block vs NAS/Mamba模型 结果汇总\n")
         f.write("="*80 + "\n")
         f.write(f"实验配置：\n")
         f.write(f"  - 批次大小：{BATCH_SIZE}\n")
@@ -425,6 +505,8 @@ def main():
         f.write(f"  - 过拟合阈值：{VAL_LOSS_RATIO}倍训练损失\n")
         f.write(f"  - 多频段滤波：{FRE_FILTER}\n")
         f.write(f"  - 验证方式：{'留一法' if LOSO else '被试内'}\n")
+        f.write(f"  - 模型类型：{model_type}\n")
+        f.write(f"  - 使用NAS：{USE_NAS}\n")
         f.write("="*80 + "\n")
         f.write(f"各被试详细结果：\n")
         for i in range(N_SUBJECTS):
@@ -434,19 +516,37 @@ def main():
         f.write("="*80 + "\n")
         f.write(f"平均性能对比：\n")
         f.write(f"原始GC_Block | 平均准确率：{avg_original_acc:.4f} | 平均Kappa：{avg_original_kappa:.4f}\n")
-        f.write(f"改进Mamba    | 平均准确率：{avg_mamba_acc:.4f} | 平均Kappa：{avg_mamba_kappa:.4f}\n")
+        f.write(f"{model_type:11} | 平均准确率：{avg_mamba_acc:.4f} | 平均Kappa：{avg_mamba_kappa:.4f}\n")
         f.write(f"平均改进幅度 | 准确率：{avg_mamba_acc - avg_original_acc:+.4f} | Kappa：{avg_mamba_kappa - avg_original_kappa:+.4f}\n")
         f.write("="*80 + "\n")
+        
+        # 添加NAS权重信息
+        if nas_weights_all_subjects:
+            f.write(f"\nNAS架构权重分析：\n")
+            f.write(f"LC_Block1平均权重：{np.mean([w['lc_block1'] for w in nas_weights_all_subjects], axis=0)}\n")
+            f.write(f"LC_Block2平均权重：{np.mean([w['lc_block2'] for w in nas_weights_all_subjects], axis=0)}\n")
     
     # 打印最终平均结果
     print(f"\n{'='*70}")
     print("🎯 最终平均结果（9个被试）")
     print(f"{'='*70}")
     print(f"原始GC_Block | 平均准确率：{avg_original_acc:.4f} | 平均Kappa：{avg_original_kappa:.4f}")
-    print(f"改进Mamba    | 平均准确率：{avg_mamba_acc:.4f} | 平均Kappa：{avg_mamba_kappa:.4f}")
+    print(f"{model_type:11} | 平均准确率：{avg_mamba_acc:.4f} | 平均Kappa：{avg_mamba_kappa:.4f}")
     print(f"平均改进幅度 | 准确率：{avg_mamba_acc - avg_original_acc:+.4f} | Kappa：{avg_mamba_kappa - avg_original_kappa:+.4f}")
     print(f"{'='*70}")
     print(f"\n📁 所有结果已保存至：{RESULTS_PATH}")
+    
+    # 打印NAS架构偏好分析
+    if nas_weights_all_subjects:
+        avg_weights_lc1 = np.mean([w['lc_block1'] for w in nas_weights_all_subjects], axis=0)
+        avg_weights_lc2 = np.mean([w['lc_block2'] for w in nas_weights_all_subjects], axis=0)
+        
+        print(f"\n🧠 NAS架构偏好分析：")
+        print(f"LC_Block1操作偏好：{avg_weights_lc1}")
+        print(f"LC_Block2操作偏好：{avg_weights_lc2}")
+        print(f"最受欢迎操作：")
+        print(f"  - LC_Block1: 操作{np.argmax(avg_weights_lc1)} (权重: {np.max(avg_weights_lc1):.3f})")
+        print(f"  - LC_Block2: 操作{np.argmax(avg_weights_lc2)} (权重: {np.max(avg_weights_lc2):.3f})")
 
 
 if __name__ == "__main__":
