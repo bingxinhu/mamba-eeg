@@ -1,7 +1,6 @@
 import numpy as np
-import scipy.signal as signal
-import torch
-from scipy import io
+import scipy.io as io
+from scipy import signal
 from sklearn.preprocessing import StandardScaler
 
 
@@ -12,9 +11,12 @@ def load_data_BCI2a(data_path, subject, training):
     data_list = []
     label_list = []
     
-    # 加载MAT文件（A01T.mat ~ A09T.mat 为训练集，A01E.mat ~ A09E.mat 为测试集）
     file_name = f"A0{subject}T.mat" if training else f"A0{subject}E.mat"
-    a = io.loadmat(f"{data_path}/{file_name}")
+    try:
+        a = io.loadmat(f"{data_path}/{file_name}")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"数据集文件 {file_name} 未找到，请检查路径")
+    
     a_data = a["data"]
     
     for ii in range(a_data.size):
@@ -23,30 +25,38 @@ def load_data_BCI2a(data_path, subject, training):
         a_data3 = a_data2[0]
         a_X = a_data3[0]  # EEG数据：(time, channels)
         a_trial = a_data3[1]  # 试次起始索引
-        a_y = a_data3[2]  # 标签（1-4，对应4类运动想象）
-        a_artifacts = a_data3[5]  # 伪影标记（0=无伪影，1=有伪影）
+        a_y = a_data3[2]  # 标签（1-4）
+        a_artifacts = a_data3[5]  # 伪影标记（0=无伪影）
         
         for trial in range(a_trial.size):
             if a_artifacts[trial] == 0:  # 仅保留无伪影试次
                 start_idx = int(a_trial[trial].item())
                 end_idx = start_idx + window_length
-                # 提取数据并转置为 (channels, time) 格式
+                if end_idx > a_X.shape[0]:  # 防止索引越界
+                    continue
                 eeg_data = np.transpose(a_X[start_idx:end_idx, :n_channels])
                 data_list.append(eeg_data)
-                label_list.append(int(a_y[trial].item()) - 1)  # 标签转为0-3（适配PyTorch分类）
+                label_list.append(int(a_y[trial].item()) - 1)  # 标签转为0-3
+    
+    if not data_list:
+        raise ValueError(f"未加载到有效数据，请检查数据集 {file_name}")
     
     return np.array(data_list), np.array(label_list)
 
 
 def load_data_BCI2b(data_path, subject, training):
-    """加载BCI2b数据集（2分类，3通道，备用）"""
+    """加载BCI2b数据集（2分类，3通道）"""
     n_channels = 3
     window_length = 8 * 250  # 8秒原始数据
     data_list = []
     label_list = []
     
     file_name = f"B0{subject}T.mat" if training else f"B0{subject}E.mat"
-    a = io.loadmat(f"{data_path}/{file_name}")
+    try:
+        a = io.loadmat(f"{data_path}/{file_name}")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"数据集文件 {file_name} 未找到，请检查路径")
+    
     a_data = a["data"]
     
     for ii in range(a_data.size):
@@ -62,9 +72,14 @@ def load_data_BCI2b(data_path, subject, training):
             if a_artifacts[trial] == 0:
                 start_idx = int(a_trial[trial].item())
                 end_idx = start_idx + window_length
+                if end_idx > a_X.shape[0]:
+                    continue
                 eeg_data = np.transpose(a_X[start_idx:end_idx, :n_channels])
                 data_list.append(eeg_data)
                 label_list.append(int(a_y[trial].item()) - 1)  # 标签转为0-1
+    
+    if not data_list:
+        raise ValueError(f"未加载到有效数据，请检查数据集 {file_name}")
     
     return np.array(data_list), np.array(label_list)
 
@@ -125,15 +140,19 @@ def bandpass_filter(data, bandFiltCutF, fs, filtOrder=50, axis=1, filtType='filt
         return data
     
     # 设计FIR滤波器
+    nyq = 0.5 * fs  # 奈奎斯特频率
     if bandFiltCutF[0] in (0, None):
         print(f"🔧 应用低通滤波（截止频率：{bandFiltCutF[1]}Hz）")
-        h = signal.firwin(filtOrder + 1, cutoff=bandFiltCutF[1], pass_zero="lowpass", fs=fs)
+        cutoff = bandFiltCutF[1] / nyq
+        h = signal.firwin(filtOrder + 1, cutoff=cutoff, pass_zero="lowpass")
     elif bandFiltCutF[1] in (None, fs/2.0):
         print(f"🔧 应用高通滤波（截止频率：{bandFiltCutF[0]}Hz）")
-        h = signal.firwin(filtOrder + 1, cutoff=bandFiltCutF[0], pass_zero="highpass", fs=fs)
+        cutoff = bandFiltCutF[0] / nyq
+        h = signal.firwin(filtOrder + 1, cutoff=cutoff, pass_zero="highpass")
     else:
         print(f"🔧 应用带通滤波（频段：{bandFiltCutF[0]}-{bandFiltCutF[1]}Hz）")
-        h = signal.firwin(filtOrder + 1, cutoff=bandFiltCutF, pass_zero="bandpass", fs=fs)
+        cutoff = [b / nyq for b in bandFiltCutF]
+        h = signal.firwin(filtOrder + 1, cutoff=cutoff, pass_zero="bandpass")
     
     # 应用滤波（filtfilt避免相位偏移，更适合EEG）
     if filtType == 'filtfilt':
@@ -147,7 +166,7 @@ def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=False,
     """核心数据预处理函数：加载→截取生理窗口→标准化→滤波→返回张量"""
     if dataset == 'BCI2a':
         fs = 250  # BCI2a采样率250Hz
-        t1 = int(1.5 * fs)  # 运动想象关键窗口：1.5秒开始（排除刺激前基线）
+        t1 = int(1.5 * fs)  # 运动想象关键窗口：1.5秒开始
         t2 = int(6 * fs)    # 6秒结束（共4.5秒有效数据）
         T = t2 - t1         # 最终时序长度：1125（250*4.5）
         n_raw_chans = 22    # 原始通道数
@@ -181,9 +200,9 @@ def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=False,
         X_train, X_test = standardize_data(X_train, X_test, n_raw_chans)
         print("✅ 数据标准化完成")
     
-    # 4. 多频段滤波（提取EEG关键频段：δ(1-4)、θ(4-8)、α(8-12)、β(12-30)、γ(30-40)）
+    # 4. 多频段滤波（提取EEG关键频段）
     if fre_filter:
-        filt_banks = [[1,4], [4,8], [8,12], [12,30], [30,40]]
+        filt_banks = [[1,4], [4,8], [8,12], [12,30], [30,40]]  # δ,θ,α,β,γ
         n_bands = len(filt_banks)
         # 初始化多频段数据存储
         X_train_bands = np.zeros((X_train.shape[0], 1, n_raw_chans * n_bands, T))
@@ -193,27 +212,15 @@ def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=False,
             # 对每个频段单独滤波（按时间维度）
             X_train_band = bandpass_filter(X_train.squeeze(1), band, fs, axis=-1)
             X_test_band = bandpass_filter(X_test.squeeze(1), band, fs, axis=-1)
-            # 分配到对应频段通道（如第1频段→0-21通道，第2频段→22-43通道...）
+            # 分配到对应频段通道
             start_idx = i * n_raw_chans
             end_idx = (i + 1) * n_raw_chans
             X_train_bands[:, 0, start_idx:end_idx, :] = X_train_band
             X_test_bands[:, 0, start_idx:end_idx, :] = X_test_band
         
-        # 替换为多频段数据（通道数=原始通道数×频段数）
+        # 替换为多频段数据
         X_train = X_train_bands
         X_test = X_test_bands
         print(f"✅ 多频段滤波完成（频段数：{n_bands}，总通道数：{n_raw_chans * n_bands}）")
-    
-    # 5. 转换为PyTorch张量
-    X_train = torch.FloatTensor(X_train)
-    y_train = torch.LongTensor(y_train)
-    X_test = torch.FloatTensor(X_test)
-    y_test = torch.LongTensor(y_test)
-    
-    # 打印数据信息
-    print(f"📊 数据形状：")
-    print(f"   - 训练集：{X_train.shape}（样本数, 1, 通道数, 时序长度）")
-    print(f"   - 测试集：{X_test.shape}")
-    print(f"   - 训练标签类别：{torch.unique(y_train)}（共{len(torch.unique(y_train))}类）")
     
     return X_train, y_train, X_test, y_test

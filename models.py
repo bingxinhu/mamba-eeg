@@ -1,353 +1,266 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+from mamba_ssm import Mamba
 
 
-# -------------------------- 基础模块 --------------------------
-class LC_Block(nn.Module):
-    """局部特征提取块：空间卷积+深度可分离卷积+池化"""
-    def __init__(self, F1, kernLength, Chans, D=2, dropout=0.3, activation='elu', AveragePooling=True):
-        super(LC_Block, self).__init__()
-        self.conv1 = nn.Conv2d(1, F1, kernel_size=(1, kernLength), padding='same')
-        self.bn1 = nn.BatchNorm2d(F1)
+class WidebandEEGMambaNet(nn.Module):
+    """融合Mamba的宽态EEG网络：局部卷积+全局长时序建模"""
+    def __init__(self, n_channels, n_classes, n_timepoints, use_freq=True, dropout=0.3, mamba_dim=64):
+        super(WidebandEEGMambaNet, self).__init__()
+        self.use_freq = use_freq
+        self.n_bands = 5 if use_freq else 1
+        self.mamba_dim = mamba_dim
         
-        self.dwconv = nn.Conv2d(F1, F1*D, kernel_size=(Chans, 1), groups=F1)
-        self.bn2 = nn.BatchNorm2d(F1*D)
+        # 计算每个频段的基础通道数（多频段时总通道数是基础通道×频段数）
+        base_channels = n_channels // self.n_bands if use_freq else n_channels
         
-        self.activation = nn.ELU() if activation == 'elu' else nn.ReLU()
-        pool_size = (1, kernLength // 8)
-        self.pool1 = nn.AvgPool2d(pool_size) if AveragePooling else nn.MaxPool2d(pool_size)
-        self.dropout1 = nn.Dropout(dropout)
+        # 1. 空间特征提取（跨通道卷积）
+        self.spatial_conv = nn.Conv2d(
+            in_channels=1,
+            out_channels=32,
+            kernel_size=(base_channels, 1),  # 对每个频段的通道单独卷积
+            stride=1,
+            padding=0
+        )
+        self.spatial_bn = nn.BatchNorm2d(32)
         
-        self.sep_conv = nn.Conv2d(F1*D, F1*D, kernel_size=(1, kernLength//4), padding='same', groups=F1*D)
-        self.bn3 = nn.BatchNorm2d(F1*D)
-        self.pool2 = nn.AvgPool2d(pool_size) if AveragePooling else nn.MaxPool2d(pool_size)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        
-        x = self.dwconv(x)
-        x = self.bn2(x)
-        x = self.activation(x)
-        x = self.pool1(x)
-        x = self.dropout1(x)
-        
-        x = self.sep_conv(x)
-        x = self.bn3(x)
-        x = self.activation(x)
-        x = self.pool2(x)
-        x = self.dropout2(x)
-        
-        return x.squeeze(2)
-
-
-class SE_Block(nn.Module):
-    """注意力模块：通道/频段注意力"""
-    def __init__(self, activation1='relu', activation2='sigmoid', BandSE=True):
-        super(SE_Block, self).__init__()
-        self.BandSE = BandSE
-        self.activation1 = nn.ReLU() if activation1 == 'relu' else nn.ELU()
-        self.activation2 = nn.Sigmoid() if activation2 == 'sigmoid' else nn.ReLU()
-
-    def forward(self, x):
-        if self.BandSE:
-            x_avg = torch.mean(x, dim=2).unsqueeze(1)
-            fc1 = nn.Linear(x_avg.size(2), 2).to(x.device)
-            fc2 = nn.Linear(2, x_avg.size(2)).to(x.device)
-            x_se = self.activation2(fc2(self.activation1(fc1(x_avg))))
-            return x * x_se.permute(0, 2, 1)
-        else:
-            x_avg = torch.mean(x, dim=1).unsqueeze(1)
-            fc1 = nn.Linear(x_avg.size(2), 2).to(x.device)
-            fc2 = nn.Linear(2, x_avg.size(2)).to(x.device)
-            x_se = self.activation2(fc2(self.activation1(fc1(x_avg))))
-            return x * x_se
-
-
-class GC_Block(nn.Module):
-    """原始全局卷积块（保留用于对比）"""
-    def __init__(self, depth=2, kernel_size=4, n_windows=5, step=4, activation='elu', TimeConv=True):
-        super(GC_Block, self).__init__()
-        self.depth = depth
-        self.n_windows = n_windows
-        self.step = step
-        self.TimeConv = TimeConv
-        self.activation = nn.ELU() if activation == 'elu' else nn.ReLU()
-        self.conv_layers = nn.ModuleList()
-
-    def forward(self, x):
-        F1, F2 = x.size(1), x.size(2)
-        if self.TimeConv:
-            self.conv_layers = nn.ModuleList([
-                nn.Conv1d(F1, F1, kernel_size=4, dilation=i+1, padding='same').to(x.device)
-                for i in range(self.depth)
-            ])
-        else:
-            self.conv_layers = nn.ModuleList([
-                nn.Conv1d(F2, F2, kernel_size=4, dilation=i+1, padding='same').to(x.device)
-                for i in range(self.depth)
-            ])
-        
-        sw_concat = []
-        for j in range(self.n_windows):
-            if self.TimeConv:
-                st, end = j*self.step, F2 - (self.n_windows-j-1)*self.step
-                sw = x[:, :, st:end]
-                se_block = SE_Block(BandSE=False)(sw)
-                last_block = se_block
-                for i in range(self.depth):
-                    block = self.conv_layers[i](last_block)
-                    block = F.batch_norm(block, torch.zeros_like(block.mean(dim=[0,2])).to(x.device),
-                                         torch.ones_like(block.var(dim=[0,2])).to(x.device), training=self.training)
-                    block = self.activation(block)
-                    block = F.dropout(block, p=0.3, training=self.training)
-                    block += se_block
-                    last_block = self.activation(block)
-                sw_concat.append(last_block.flatten(1))
-            else:
-                st, end = j*self.step, F1 - (self.n_windows-j-1)*self.step
-                sw = x[:, st:end, :]
-                se_block = SE_Block(BandSE=True)(sw)
-                last_block = se_block
-                for i in range(self.depth):
-                    block = self.conv_layers[i](last_block.transpose(1,2)).transpose(1,2)
-                    block = F.batch_norm(block, torch.zeros_like(block.mean(dim=[0,2])).to(x.device),
-                                         torch.ones_like(block.var(dim=[0,2])).to(x.device), training=self.training)
-                    block = self.activation(block)
-                    block = F.dropout(block, p=0.3, training=self.training)
-                    block += se_block
-                    last_block = self.activation(block)
-                sw_concat.append(last_block.flatten(1))
-        
-        return torch.cat(sw_concat, dim=1)
-
-
-# -------------------------- 注意力模块 --------------------------
-class ChannelAttention1D(nn.Module):
-    """1D通道注意力"""
-    def __init__(self, hidden_dim, reduction=4):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // reduction),
+        # 2. 多尺度时间卷积分支
+        self.time_branch1 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=(1, 11), stride=1, padding=(0, 5)),
+            nn.BatchNorm2d(64),
             nn.ELU(),
-            nn.Linear(hidden_dim // reduction, hidden_dim),
-            nn.Sigmoid()
+            nn.AvgPool2d(kernel_size=(1, 2)),  # 时间维度降采样
+            nn.Dropout(dropout)
+        )
+        
+        self.time_branch2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=(1, 21), stride=1, padding=(0, 10)),
+            nn.BatchNorm2d(64),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 2)),
+            nn.Dropout(dropout)
+        )
+        
+        # 3. 频率注意力机制（对多频段特征加权）
+        if use_freq:
+            self.freq_attention = nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)),  # 压缩空间和时间维度
+                nn.Flatten(),
+                nn.Linear(128, self.n_bands),  # 输出每个频段的权重
+                nn.Softmax(dim=1)
+            )
+        
+        # 4. 在Mamba之前的时间维度降采样
+        self.time_downsample = nn.Sequential(
+            nn.Conv2d(128, mamba_dim, kernel_size=(1, 3), stride=(1, 2), padding=(0, 1)),
+            nn.BatchNorm2d(mamba_dim),
+            nn.ELU()
+        )
+        
+        # 5. Mamba全局长时序处理模块
+        self.mamba = Mamba(
+            d_model=mamba_dim,  # 输入特征维度（减小到64）
+            d_state=16,         # 状态维度
+            d_conv=4,           # 卷积核维度
+            expand=2            # 扩展因子
+        )
+        
+        # 6. 分类头
+        # 使用自适应池化来避免维度计算错误
+        self.classifier = nn.Sequential(
+            nn.Conv2d(mamba_dim, 128, kernel_size=(1, 13), padding=(0, 6)),
+            nn.BatchNorm2d(128),
+            nn.ELU(),
+            nn.AdaptiveAvgPool2d((1, 1)),  # 自适应池化到1x1
+            nn.Dropout(dropout),
+            nn.Flatten(),
+            nn.Linear(128, n_classes)  # 全连接分类
         )
 
     def forward(self, x):
-        b, c, _ = x.shape
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1)
-        return x * y
-
-
-# -------------------------- 改进Mamba核心模块 --------------------------
-def calc_temporal_corr(x, window_size=50):
-    """计算时序相关性"""
-    batch, chans, time = x.shape
-    corr_scores = []
-    
-    for b in range(batch):
-        chan_corr = []
-        for c in range(chans):
-            sig = x[b, c]
-            if len(sig) > window_size:
-                corr_val = torch.corrcoef(torch.stack([sig[:-1], sig[1:]]))[0, 1]
-                if torch.isnan(corr_val):
-                    corr_val = torch.tensor(0.0, device=x.device)
-                chan_corr.append(corr_val.item())
+        # 输入形状: (batch, 1, n_channels, n_timepoints)
+        #print(f"0. Input shape: {x.shape}")
+        batch_size = x.size(0)
+        
+        # 空间特征提取：跨通道卷积捕获空间相关性
+        x = self.spatial_conv(x)  # (batch, 32, 1, n_timepoints)
+        #print(f"1. After spatial_conv: {x.shape}")
+        x = self.spatial_bn(x)
+        x = F.elu(x)
+        
+        # 多尺度时间特征学习：不同卷积核捕获不同时间尺度模式
+        x1 = self.time_branch1(x)
+        #print(f"2. After time_branch1: {x1.shape}")
+        x2 = self.time_branch2(x)
+        #print(f"3. After time_branch2: {x2.shape}")
+        x = torch.cat([x1, x2], dim=1)  # (batch, 128, 1, time/2) 合并特征
+        #print(f"4. After concat: {x.shape}")
+        
+        # 频率注意力加权：动态调整不同频段的重要性
+        if self.use_freq:
+            freq_weights = self.freq_attention(x)  # (batch, n_bands) 得到每个频段的权重
+            band_size = x.size(1) // self.n_bands  # 按特征通道维度分割（128/5=25.6→25，最后一个频段多1）
+            weighted_bands = []
+            for i in range(self.n_bands):
+                # 从特征通道维度(dim=1)分割对应频段
+                start = i * band_size
+                end = start + band_size if i < self.n_bands - 1 else x.size(1)
+                band = x[:, start:end, :, :]
+                # 应用权重（扩展维度以匹配广播）
+                weighted_bands.append(band * freq_weights[:, i].view(-1, 1, 1, 1))
+            x = torch.cat(weighted_bands, dim=1)  # 合并加权后的频段特征
+            #print(f"5. After freq attention: {x.shape}")
+        
+        # 时间维度降采样（减少Mamba处理的序列长度）
+        x = self.time_downsample(x)  # (batch, mamba_dim, 1, time/4)
+        #print(f"6. After time_downsample: {x.shape}")
+        
+        # Mamba全局长时序处理：转换为Mamba输入格式
+        # 检查当前张量维度
+        if x.dim() == 4:
+            batch_size, d_model, height, seq_len = x.shape
+            #print(f"7. x is 4D: batch={batch_size}, d_model={d_model}, height={height}, seq_len={seq_len}")
+            
+            # 如果高度为1，则去除该维度
+            if height == 1:
+                x = x.squeeze(2)  # (batch, d_model, seq_len)
+                #print(f"8. After squeeze: {x.shape}")
             else:
-                chan_corr.append(0.0)
-        corr_scores.append(np.mean(chan_corr))
-    
-    return torch.tensor(np.mean(corr_scores), device=x.device)
+                # 高度不为1，将高度和序列维度合并
+                x = x.reshape(batch_size, d_model, height * seq_len)
+                #print(f"8. After reshape: {x.shape}")
+        
+        # 确保形状为 (batch, seq_len, d_model) - Mamba期望的格式
+        if x.dim() == 3:
+            # 检查当前维度顺序
+            if x.shape[1] == self.mamba_dim:  # 如果第二个维度是d_model，则转置
+                x = x.transpose(1, 2)  # (batch, seq_len, d_model)
+                #print(f"9. After transpose: {x.shape}")
+        
+        x = x.contiguous()
+        #print(f"10. Before Mamba: shape={x.shape}, dim={x.dim()}")
+        
+        try:
+            mamba_out = self.mamba(x)  # (batch, seq_len, d_model)
+            #print(f"11. After Mamba: {mamba_out.shape}")
+        except Exception as e:
+            print(f"Error in Mamba: {e}")
+            print(f"Input to Mamba shape: {x.shape}")
+            print(f"Input to Mamba dim: {x.dim()}")
+            raise
+        
+        # 恢复卷积操作所需的维度格式
+        mamba_out = mamba_out.transpose(1, 2).unsqueeze(2)  # (batch, d_model, 1, seq_len)
+        #print(f"12. After transpose and unsqueeze: {mamba_out.shape}")
+        
+        # 分类头：最终预测
+        out = self.classifier(mamba_out)
+        #print(f"13. Output shape: {out.shape}")
+        return out
 
 
-class ImprovedMambaStyleBlock(nn.Module):
-    """改进Mamba时序块"""
-    def __init__(self, input_channels, hidden_dim=32, n_local_blocks=3):
-        super().__init__()
-        self.input_channels = input_channels
-        self.hidden_dim = hidden_dim
-        self.n_local_blocks = n_local_blocks
+class WidebandEEGNet(nn.Module):
+    """原始的WidebandEEGNet实现（如果不使用，请保持占位实现）"""
+    def __init__(self, n_channels, n_classes, n_timepoints, use_freq=True):
+        super(WidebandEEGNet, self).__init__()
+        self.use_freq = use_freq
         
-        # 残差连接
-        self.res_conv = nn.Conv1d(input_channels, hidden_dim, kernel_size=1) if input_channels != hidden_dim else nn.Identity()
+        # 1. 空间特征提取
+        self.spatial_conv = nn.Conv2d(
+            in_channels=1,
+            out_channels=16,
+            kernel_size=(n_channels, 1),
+            stride=1,
+            padding=0
+        )
+        self.spatial_bn = nn.BatchNorm2d(16)
         
-        self.input_proj = nn.Conv1d(input_channels, hidden_dim, kernel_size=1, padding=0)
-        self.bn_proj = nn.BatchNorm1d(hidden_dim)
-        
-        # 多头注意力
-        self.multihead_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim, 
-            num_heads=4, 
-            batch_first=True,
-            dropout=0.1
+        # 2. 时间卷积
+        self.time_conv = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=(1, 25), stride=1, padding=(0, 12)),
+            nn.BatchNorm2d(32),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 4)),
+            nn.Dropout(0.3)
         )
         
-        self.channel_att = ChannelAttention1D(hidden_dim)
-        
-        # 动态卷积层
-        self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2, dilation=2)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.conv3 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=4, dilation=4)
-        self.bn3 = nn.BatchNorm1d(hidden_dim)
-        
-        self.activation = nn.ELU()
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.dropout = nn.Dropout(p=0.3)
-
-    def adjust_dilation(self, corr_score):
-        """根据时序相关性动态调整扩张系数"""
-        if corr_score > 0.6:
-            return 1, 2
-        elif corr_score < 0.3:
-            return 2, 4
-        else:
-            return 1, 3
-
-    def forward(self, x, dropout_p=0.3):
-        batch, _, time = x.shape
-        
-        residual = self.res_conv(x)
-        
-        x = self.input_proj(x)
-        x = self.bn_proj(x)
-        x = self.activation(x)
-        
-        # 多头注意力
-        x_attn = x.permute(0, 2, 1)
-        attn_out, _ = self.multihead_attn(x_attn, x_attn, x_attn)
-        x = x + attn_out.permute(0, 2, 1)
-        
-        x = self.channel_att(x)
-        
-        # 动态调整扩张
-        corr_score = calc_temporal_corr(x).item()
-        dilation2, dilation3 = self.adjust_dilation(corr_score)
-        
-        # 应用卷积
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.activation(x)
-        
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.activation(x)
-        
-        x = self.conv3(x)
-        x = self.bn3(x)
-        x = self.activation(x)
-        
-        # 残差连接
-        x = x + residual[:, :, :x.size(2)]
-        
-        self.dropout.p = dropout_p
-        x = self.dropout(x)
-        
-        # 局部池化
-        local_window = max(1, time // self.n_local_blocks)
-        if local_window > 0 and time >= local_window:
-            local_pool = x.unfold(dimension=2, size=local_window, step=local_window)
-            local_pool = local_pool.mean(dim=3)
-            local_pool_flat = local_pool.flatten(1)
-        else:
-            local_pool_flat = self.global_pool(x).squeeze(2)
-        
-        global_pool = self.global_pool(x).squeeze(2)
-        
-        return torch.cat([local_pool_flat, global_pool], dim=1)
-
-
-class ImprovedMambaStyleGC_Block(nn.Module):
-    """Mamba风格GC块"""
-    def __init__(self, input_channels, hidden_dim=32, n_local_blocks=3):
-        super().__init__()
-        self.mamba_block = ImprovedMambaStyleBlock(
-            input_channels=input_channels,
-            hidden_dim=hidden_dim,
-            n_local_blocks=n_local_blocks
+        # 3. 分类头
+        time_dim = n_timepoints // 4  # 经过池化后的时间长度
+        self.classifier = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=(1, 15), padding=(0, 7)),
+            nn.BatchNorm2d(64),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 2)),
+            nn.Dropout(0.3),
+            nn.Flatten(),
+            nn.Linear(64 * (time_dim // 2), n_classes)
         )
-        self.output_dim = None
-        self.dim_initialized = False
-
-    def forward(self, x, dropout_p=0.3):
-        output = self.mamba_block(x, dropout_p=dropout_p)
-        
-        if not self.dim_initialized:
-            self.output_dim = output.shape[1]
-            self.dim_initialized = True
-        
-        return output
-
-
-# -------------------------- 完整模型 --------------------------
-class EEG_DBNet(nn.Module):
-    """原始EEG模型（使用GC_Block，用于对比）"""
-    def __init__(self, nb_classes=4, Chans=22, Samples=1125):
-        super(EEG_DBNet, self).__init__()
-        self.lc_block1 = LC_Block(F1=8, kernLength=48, Chans=Chans, dropout=0.3)
-        self.lc_block2 = LC_Block(F1=16, kernLength=64, Chans=Chans, dropout=0.3, AveragePooling=False)
-        
-        self.gc_block1 = GC_Block(TimeConv=True, depth=4, n_windows=6, step=1)
-        self.gc_block2 = GC_Block(TimeConv=False, depth=4, n_windows=6, step=1)
-        
-        self.fc = nn.Linear(5250, nb_classes)
 
     def forward(self, x):
-        x1 = self.lc_block1(x)
-        x2 = self.lc_block2(x)
+        # 输入形状: (batch, 1, n_channels, n_timepoints)
+        x = self.spatial_conv(x)
+        x = self.spatial_bn(x)
+        x = F.elu(x)
         
-        x1 = self.gc_block1(x1)
-        x2 = self.gc_block2(x2)
+        x = self.time_conv(x)
         
-        x = torch.cat([x1, x2], dim=1)
-        return self.fc(x)
+        out = self.classifier(x)
+        return out
 
 
-class EEG_DBNet_ImprovedMamba(nn.Module):
-    """改进Mamba模型（基础架构，无NAS）"""
-    def __init__(self, nb_classes=4, Chans=22, hidden_dim1=64, hidden_dim2=128, n_local_blocks=4):
-        super().__init__()
-        self.nb_classes = nb_classes
-        self.fc_initialized = False
+class BaselineEEGNet(nn.Module):
+    """基线EEGNet实现（Shallow ConvNet）"""
+    def __init__(self, n_channels, n_classes, n_timepoints):
+        super(BaselineEEGNet, self).__init__()
         
-        # 使用基础的LC_Block
-        self.lc_block1 = LC_Block(F1=8, kernLength=48, Chans=Chans, dropout=0.3)
-        self.lc_block2 = LC_Block(F1=16, kernLength=64, Chans=Chans, dropout=0.3, AveragePooling=False)
-        
-        # Mamba块
-        self.mamba_block1 = ImprovedMambaStyleGC_Block(
-            input_channels=16,
-            hidden_dim=hidden_dim1,
-            n_local_blocks=n_local_blocks
-        )
-        self.mamba_block2 = ImprovedMambaStyleGC_Block(
-            input_channels=32,
-            hidden_dim=hidden_dim2,
-            n_local_blocks=n_local_blocks
+        # 1. 时间卷积
+        self.time_conv = nn.Sequential(
+            nn.Conv2d(1, 40, kernel_size=(1, 25), stride=1, padding=(0, 12)),
+            nn.Conv2d(40, 40, kernel_size=(n_channels, 1), stride=1),
+            nn.BatchNorm2d(40),
         )
         
-        self.fc = None
+        # 2. 深度可分离卷积
+        self.depthwise_conv = nn.Conv2d(40, 40, kernel_size=(1, 15), stride=1, padding=(0, 7), groups=40)
+        self.bn2 = nn.BatchNorm2d(40)
+        
+        # 3. 平均池化
+        self.pool = nn.AvgPool2d(kernel_size=(1, 75), stride=(1, 15))
+        
+        # 4. 分类头
+        # 计算时间维度变化
+        time_dim = n_timepoints  # 输入时间长度
+        time_dim = time_dim  # 时间卷积不改变长度
+        time_dim = (time_dim - 15 + 14) // 1 + 1  # 深度卷积后: (W - K + 2P)/S + 1
+        time_dim = (time_dim - 75 + 0) // 15 + 1  # 池化后
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Flatten(),
+            nn.Linear(40 * time_dim, n_classes)
+        )
 
-    def forward(self, x, dropout_p=0.3):
-        x1 = self.lc_block1(x)
-        x2 = self.lc_block2(x)
+    def forward(self, x):
+        # 输入形状: (batch, 1, n_channels, n_timepoints)
+        x = self.time_conv(x)
+        x = self.depthwise_conv(x)
+        x = self.bn2(x)
+        x = x * x  # 平方激活
+        x = self.pool(x)
+        x = torch.log(torch.clamp(x, min=1e-6))  # 对数激活
         
-        x1_mamba = self.mamba_block1(x1, dropout_p=dropout_p)
-        x2_mamba = self.mamba_block2(x2, dropout_p=dropout_p)
-        
-        if not self.fc_initialized:
-            fc_input_dim = x1_mamba.shape[1] + x2_mamba.shape[1]
-            print(f"🔧 初始化全连接层：输入维度={fc_input_dim}，输出维度={self.nb_classes}")
-            self.fc = nn.Linear(fc_input_dim, self.nb_classes).to(x1_mamba.device)
-            self.fc_initialized = True
-        
-        x_concat = torch.cat([x1_mamba, x2_mamba], dim=1)
-        return self.fc(x_concat)
+        out = self.classifier(x)
+        return out
+
+
+def get_model(model_name, n_channels, n_classes, n_timepoints, use_freq=False, mamba_dim=64):
+    """模型选择接口（增加Mamba模型支持）"""
+    if model_name == "wideband":
+        return WidebandEEGNet(n_channels, n_classes, n_timepoints, use_freq)
+    elif model_name == "wideband_mamba":
+        return WidebandEEGMambaNet(n_channels, n_classes, n_timepoints, use_freq, mamba_dim=mamba_dim)
+    elif model_name == "baseline":
+        return BaselineEEGNet(n_channels, n_classes, n_timepoints)
+    else:
+        raise ValueError(f"未知模型: {model_name}")
