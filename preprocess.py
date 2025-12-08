@@ -162,8 +162,41 @@ def bandpass_filter(data, bandFiltCutF, fs, filtOrder=50, axis=1, filtType='filt
     return data_out
 
 
-def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=False, dataset='BCI2a'):
-    """核心数据预处理函数：加载→截取生理窗口→标准化→滤波→返回张量"""
+def augment_eeg_data_simple(X, y, augment_factor=2):
+    """简化的EEG数据增强函数"""
+    if augment_factor < 1:
+        return X, y
+    
+    X_augmented = [X]
+    y_augmented = [y]
+    
+    for i in range(augment_factor):
+        # 1. 高斯噪声增强
+        noise = np.random.normal(0, 0.02, X.shape)  # 2%的高斯噪声
+        X_augmented.append(X + noise)
+        y_augmented.append(y)
+        
+        # 2. 振幅缩放增强
+        scale = np.random.uniform(0.9, 1.1, (X.shape[0], 1, 1, 1))
+        X_augmented.append(X * scale)
+        y_augmented.append(y)
+    
+    # 合并所有增强数据
+    X_augmented = np.concatenate(X_augmented, axis=0)
+    y_augmented = np.concatenate(y_augmented, axis=0)
+    
+    # 打乱顺序
+    indices = np.arange(len(X_augmented))
+    np.random.shuffle(indices)
+    X_augmented = X_augmented[indices]
+    y_augmented = y_augmented[indices]
+    
+    return X_augmented, y_augmented
+
+
+def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=False, 
+             dataset='BCI2a', augment=False, augment_factor=1):
+    """增强版数据预处理函数：加载→截取生理窗口→标准化→滤波→增强→返回张量"""
     if dataset == 'BCI2a':
         fs = 250  # BCI2a采样率250Hz
         t1 = int(1.5 * fs)  # 运动想象关键窗口：1.5秒开始
@@ -195,12 +228,18 @@ def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=False,
     n_te, _, _ = X_test.shape
     X_test = X_test[:, :, t1:t2].reshape(n_te, 1, n_raw_chans, T)    # 测试集
     
-    # 3. 按通道标准化
+    # 3. 数据增强（仅在训练时且未使用留一法时进行）
+    if augment and not loso:
+        print(f"🔄 数据增强：原始样本数 {len(X_train)}")
+        X_train, y_train = augment_eeg_data_simple(X_train, y_train, augment_factor)
+        print(f"✅ 数据增强完成：增强后样本数 {len(X_train)}")
+    
+    # 4. 按通道标准化
     if is_standard:
         X_train, X_test = standardize_data(X_train, X_test, n_raw_chans)
         print("✅ 数据标准化完成")
     
-    # 4. 多频段滤波（提取EEG关键频段）
+    # 5. 多频段滤波（提取EEG关键频段）
     if fre_filter:
         filt_banks = [[1,4], [4,8], [8,12], [12,30], [30,40]]  # δ,θ,α,β,γ
         n_bands = len(filt_banks)
