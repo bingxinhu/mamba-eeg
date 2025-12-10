@@ -1,0 +1,21 @@
+python main.py \
+  --data_path ./dataset/2a \
+  --subject 0 \
+  --dataset BCI2a \
+  --model multiband_mamba \
+  --mamba_dim 128 \
+  --batch_size 32 \
+  --dropout 0.6 \
+  --epochs 1000 \
+  --lr 3e-4 \
+  --weight_decay 0.002 \
+  --mixup \
+  --mixup_alpha 0.4 \
+  --grad_clip 0.3 \
+  --patience 500 \
+  --augment \
+  --augment_factor 3 \
+  --save_model \
+  --plot_curves \
+  --plot_cm \
+  --save_dir ./experiment_results/$(date +%Y%m%d_%H%M%S)
