@@ -5,16 +5,16 @@ python main.py \
   --model multiband_mamba \
   --mamba_dim 128 \
   --batch_size 32 \
-  --dropout 0.6 \
+  --dropout 0.5 \
   --epochs 1000 \
   --lr 3e-4 \
-  --weight_decay 0.002 \
+  --weight_decay 0.001 \
   --mixup \
   --mixup_alpha 0.4 \
   --grad_clip 0.3 \
-  --patience 500 \
+  --patience 200 \
   --augment \
-  --augment_factor 3 \
+  --augment_factor 2 \
   --save_model \
   --plot_curves \
   --plot_cm \
