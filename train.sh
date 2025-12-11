@@ -5,7 +5,7 @@ python main.py \
   --model multiband_mamba \
   --mamba_dim 96 \
   --batch_size 32 \
-  --dropout 0.5 \
+  --dropout 0.4 \
   --epochs 1000 \
   --lr 3e-4 \
   --weight_decay 0.001 \
