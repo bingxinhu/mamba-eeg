@@ -3,7 +3,7 @@ python main.py \
   --subject 0 \
   --dataset BCI2a \
   --model multiband_mamba \
-  --mamba_dim 128 \
+  --mamba_dim 96 \
   --batch_size 32 \
   --dropout 0.5 \
   --epochs 1000 \
