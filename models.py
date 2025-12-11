@@ -294,35 +294,38 @@ class StableWidebandEEGMambaNet(nn.Module):
         out = self.classifier(x)
         return out
 
-"""针对多频段数据的专用Mamba网络"""
+"""针对多频段数据的专用Mamba网络（添加BatchNorm层）"""
 class MultiBandMambaNet(nn.Module):
     def __init__(self, n_channels, n_classes, n_timepoints, dropout=0.5, mamba_dim=32):
         super(MultiBandMambaNet, self).__init__()
         self.n_bands = 5
         raw_channels = n_channels // self.n_bands
         
-        # 频段分离卷积
+        # 频段分离卷积 - 在每个卷积层后添加BatchNorm
         self.band_convs = nn.ModuleList()
         for _ in range(self.n_bands):
             conv = nn.Sequential(
                 nn.Conv2d(1, 8, kernel_size=(raw_channels, 1), padding=0),
-                nn.BatchNorm2d(8),
+                nn.BatchNorm2d(8),  # 新增BatchNorm
                 nn.ELU(),
                 nn.Conv2d(8, 16, kernel_size=(1, 15), padding=(0, 7)),
-                nn.BatchNorm2d(16),
+                nn.BatchNorm2d(16),  # 新增BatchNorm
                 nn.ELU(),
                 nn.Dropout2d(dropout),
                 nn.AvgPool2d((1, 2))
             )
             self.band_convs.append(conv)
         
-        # 频段融合
+        # 频段融合 - 在融合层后添加BatchNorm
         self.band_fusion = nn.Sequential(
             nn.Conv2d(16 * self.n_bands, mamba_dim, kernel_size=(1, 3), stride=(1, 2), padding=(0, 1)),
-            nn.BatchNorm2d(mamba_dim),
+            nn.BatchNorm2d(mamba_dim),  # 新增BatchNorm
             nn.ELU(),
             nn.Dropout2d(dropout)
         )
+        
+        # Mamba前的BatchNorm层 - 新增
+        self.before_mamba_bn = nn.BatchNorm1d(mamba_dim)
         
         # 使用Mamba包装器
         self.mamba = MambaWrapper(
@@ -331,6 +334,9 @@ class MultiBandMambaNet(nn.Module):
             d_conv=4,
             expand=2
         )
+        
+        # Mamba后的BatchNorm层 - 新增
+        self.after_mamba_bn = nn.BatchNorm1d(mamba_dim)
         
         # 分类头
         self.classifier = nn.Sequential(
@@ -363,15 +369,24 @@ class MultiBandMambaNet(nn.Module):
         
         # Mamba输入处理
         if x.dim() == 4:
-            x = x.squeeze(2)
-        if x.size(1) == self.mamba.mamba.d_model:
-            x = x.transpose(1, 2)
+            x = x.squeeze(2)  # (batch, mamba_dim, seq_len)
+        
+        # Mamba前的BatchNorm
+        x = self.before_mamba_bn(x)
+        
+        # 转置为Mamba需要的格式
+        x = x.transpose(1, 2)  # (batch, seq_len, mamba_dim)
         
         # Mamba前向传播
         x = self.mamba(x)
         
+        # Mamba后的BatchNorm（需要在转置后应用）
+        x = x.transpose(1, 2)  # (batch, mamba_dim, seq_len)
+        x = self.after_mamba_bn(x)
+        x = x.transpose(1, 2)  # (batch, seq_len, mamba_dim)
+        
         # 分类
-        x = x.transpose(1, 2).unsqueeze(2)
+        x = x.transpose(1, 2).unsqueeze(2)  # (batch, mamba_dim, 1, seq_len)
         out = self.classifier(x)
         return out
 
