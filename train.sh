@@ -7,7 +7,7 @@ python main.py \
   --batch_size 32 \
   --dropout 0.5 \
   --epochs 1000 \
-  --lr 8e-4 \
+  --lr 1e-3 \
   --weight_decay 0.01 \
   --mixup \
   --mixup_alpha 0.4 \
