@@ -14,7 +14,7 @@ python main.py \
   --grad_clip 0.3 \
   --patience 200 \
   --augment \
-  --augment_factor 2 \
+  --augment_factor 4 \
   --save_model \
   --plot_curves \
   --plot_cm \
