@@ -76,9 +76,7 @@ def parse_args():
     
     # 模型参数 - 降低复杂度，增强正则化
     parser.add_argument('--model', type=str, default='auto', 
-                        choices=['baseline', 'wideband', 'wideband_mamba', 
-                                 'stable_mamba', 'regularized_mamba',
-                                 'multiband_mamba', 'auto'], 
+                        choices=['baseline', 'wideband', 'multiband_mamba', 'auto'], 
                         help='选择模型，auto表示自动选择')
     parser.add_argument('--mamba_dim', type=int, default=32, help='Mamba模块特征维度（降低）')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout率（提高）')

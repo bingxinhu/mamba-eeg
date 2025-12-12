@@ -6,13 +6,13 @@ python main.py \
   --mamba_dim 96 \
   --batch_size 32 \
   --dropout 0.5 \
-  --epochs 1000 \
+  --epochs 2000 \
   --lr 1e-3 \
   --weight_decay 0.01 \
   --mixup \
   --mixup_alpha 0.4 \
   --grad_clip 1.0 \
-  --patience 350 \
+  --patience 500 \
   --augment \
   --augment_factor 3 \
   --scheduler cosine \
