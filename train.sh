@@ -2,7 +2,7 @@ python main.py \
   --data_path ./dataset/2a \
   --subject 0 \
   --dataset BCI2a \
-  --model multiband_mamba \
+  --model Interpretable_mamba \
   --mamba_dim 96 \
   --batch_size 32 \
   --dropout 0.5 \

@@ -76,7 +76,7 @@ def parse_args():
     
     # 模型参数 - 降低复杂度，增强正则化
     parser.add_argument('--model', type=str, default='auto', 
-                        choices=['baseline', 'wideband', 'multiband_mamba', 'auto'], 
+                        choices=['baseline', 'wideband', 'multiband_mamba', 'Interpretable_mamba', 'auto'], 
                         help='选择模型，auto表示自动选择')
     parser.add_argument('--mamba_dim', type=int, default=32, help='Mamba模块特征维度（降低）')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout率（提高）')
@@ -245,17 +245,17 @@ def auto_select_model(fre_filter, n_channels, n_classes, n_timepoints):
     """根据数据特征自动选择最合适的模型"""
     if fre_filter:
         # 多频段数据，使用正则化Mamba模型
-        model_name = 'regularized_mamba'
+        model_name = 'Interpretable_mamba'
         print(f"检测到多频段数据（{n_channels}通道），自动选择 {model_name} 模型")
     else:
         # 单频段数据
         if n_timepoints > 1000:
             # 长时间序列，使用稳定的Mamba模型
-            model_name = 'stable_mamba'
+            model_name = 'multiband_mamba'
             print(f"检测到长时间序列（{n_timepoints}点），自动选择 {model_name} 模型")
         else:
             # 短时间序列，使用宽态Mamba模型
-            model_name = 'wideband_mamba'
+            model_name = 'baseline'
             print(f"检测到短时间序列（{n_timepoints}点），自动选择 {model_name} 模型")
     
     return model_name
