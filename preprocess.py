@@ -85,10 +85,6 @@ def load_data_BCI2b(data_path, subject, training):
         if file_idx == 0:
             print(f"    文件键: {list(data_dict.keys())}")
         
-        # 根据BCI Competition IV Dataset 2b的文档，数据结构可能如下：
-        # 1. 数据存储在名为'data'的键中
-        # 2. 或者直接包含多个字段
-        
         # 尝试不同的键
         data_key = None
         for key in ['data', 'X', 'eeg', 'EEG']:

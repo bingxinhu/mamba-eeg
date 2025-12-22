@@ -1,0 +1,46 @@
+# EEG分类与向量数据库配置
+
+# 数据参数
+data_path: "./dataset/2a"
+subject: 0
+dataset: "BCI2a"
+loso: false
+no_standard: false
+fre_filter: true
+augment: true
+augment_factor: 2
+
+# 模型参数
+model: "Interpretable_mamba"
+mamba_dim: 128
+dropout: 0.3
+init_type: "kaiming"
+
+# 训练参数
+batch_size: 128
+epochs: 2000
+lr: 0.001
+weight_decay: 0.01
+patience: 300
+mixup: true
+mixup_alpha: 0.4
+grad_clip: 1.0
+label_smoothing: 0.1
+optimizer: "adamw"
+scheduler: "cosine"
+
+# 向量数据库参数
+enable_vector_db: true
+db_type: "faiss"  # faiss, annoy, simple
+feature_dim: 128
+retrieval_topk: 10
+build_db_on_train: true
+use_db_for_few_shot: true
+
+# 保存与日志
+save_dir: "./results"
+save_model: true
+plot_cm: true
+plot_curves: true
+plot_retrieval: true
+verbose: 1

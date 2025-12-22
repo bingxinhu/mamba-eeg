@@ -81,6 +81,304 @@ class MambaWrapper(nn.Module):
         else:
             return output
 
+class BandAwareInterpretableMamba(nn.Module):
+    """
+    频段感知可解释Mamba网络（增强版，支持特征提取）
+    
+    新增功能：
+    1. 支持多种特征提取方式
+    2. 集成注意力可视化
+    3. 支持向量数据库的特征输出
+    """
+    def __init__(self, n_channels=22, n_classes=4, n_timepoints=1125, 
+                 d_model=32, d_state=16, n_bands=5, dropout=0.5, use_freq=False):
+        super().__init__()
+        
+        # 根据是否使用多频段滤波调整参数
+        if use_freq:
+            # 多频段模式下，输入通道数 = 原始通道数 × 频段数
+            self.n_bands = n_bands
+            self.raw_channels = n_channels // n_bands
+            print(f"多频段模式：原始通道数={self.raw_channels}, 频段数={n_bands}")
+        else:
+            # 单频段模式下，将所有通道作为一个频段处理
+            self.n_bands = 1
+            self.raw_channels = n_channels
+            print(f"单频段模式：通道数={self.raw_channels}")
+        
+        self.d_model = d_model
+        self.n_classes = n_classes
+        self.use_freq = use_freq
+        
+        # 1. 每个频段的独立处理
+        self.band_projections = nn.ModuleList()
+        self.band_mambas = nn.ModuleList()
+        
+        for i in range(self.n_bands):
+            # 将每个频段的通道投影到d_model
+            proj = nn.Sequential(
+                nn.Conv1d(self.raw_channels, d_model, kernel_size=1, stride=1),
+                nn.BatchNorm1d(d_model),
+                nn.ELU(),
+                nn.Dropout(dropout)
+            )
+            self.band_projections.append(proj)
+            
+            # 每个频段一个Mamba（如果可用，否则用替代）
+            mamba = MambaWrapper(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=4,
+                expand=2
+            )
+            self.band_mambas.append(mamba)
+        
+        # 2. 频段间注意力机制（可选）
+        if self.n_bands > 1:
+            self.cross_band_attention = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=4,
+                dropout=dropout,
+                batch_first=True
+            )
+            self.cross_band_attention_weights = None  # 用于存储注意力权重
+        else:
+            self.cross_band_attention = None
+        
+        # 3. 时间注意力池化
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1),
+            nn.Softmax(dim=1)
+        )
+        self.temporal_attention_weights = None  # 用于存储注意力权重
+        
+        # 4. 分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model * self.n_bands, 64),
+            nn.BatchNorm1d(64),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, n_classes)
+        )
+        
+        # 特征提取层 - 固定输出维度为128以匹配向量数据库
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(d_model * self.n_bands, 256),
+            nn.BatchNorm1d(256),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),  # 固定输出128维以匹配向量数据库
+            nn.BatchNorm1d(128),
+            nn.Tanh()
+        )
+        
+    def forward(self, x):
+        # x: (batch, 1, n_channels, n_timepoints)
+        batch_size, _, total_channels, timepoints = x.shape
+        
+        # 分割频段
+        band_features = []
+        for i in range(self.n_bands):
+            if self.n_bands > 1:
+                start = i * self.raw_channels
+                end = (i + 1) * self.raw_channels
+                band_data = x[:, :, start:end, :]  # (batch, 1, raw_channels, timepoints)
+            else:
+                # 单频段模式，使用所有通道
+                band_data = x
+            
+            band_data = band_data.squeeze(1)    # (batch, raw_channels, timepoints)
+            
+            # 频段投影
+            proj = self.band_projections[i](band_data)  # (batch, d_model, timepoints)
+            proj = proj.transpose(1, 2)                 # (batch, timepoints, d_model)
+            
+            # Mamba处理
+            mamba_out = self.band_mambas[i](proj)      # (batch, timepoints, d_model)
+            band_features.append(mamba_out)
+        
+        # 如果有多频段且使用跨频段注意力
+        if self.n_bands > 1 and self.cross_band_attention is not None:
+            # 将每个频段在时间维度上平均，然后进行跨频段注意力
+            band_vectors = [bf.mean(dim=1) for bf in band_features]  # 每个形状: (batch, d_model)
+            band_vectors_stacked = torch.stack(band_vectors, dim=1)  # (batch, n_bands, d_model)
+            
+            # 跨频段注意力
+            attended_bands, attention_weights = self.cross_band_attention(
+                band_vectors_stacked, band_vectors_stacked, band_vectors_stacked
+            )  # (batch, n_bands, d_model)
+            
+            # 保存注意力权重
+            self.cross_band_attention_weights = attention_weights
+            
+            # 将注意力后的频段特征重新分配到时间维度
+            for i in range(self.n_bands):
+                # 将注意力权重应用到原始特征
+                attention_weight = attended_bands[:, i:i+1, :]  # (batch, 1, d_model)
+                band_features[i] = band_features[i] * attention_weight
+        
+        # 对每个频段进行时间注意力池化
+        band_vectors = []
+        temporal_weights_list = []
+        for i in range(self.n_bands):
+            attn_weights = self.temporal_attention(band_features[i])  # (batch, timepoints, 1)
+            band_vector = torch.sum(band_features[i] * attn_weights, dim=1)  # (batch, d_model)
+            band_vectors.append(band_vector)
+            temporal_weights_list.append(attn_weights)
+        
+        # 保存时间注意力权重
+        self.temporal_attention_weights = temporal_weights_list
+        
+        # 拼接所有频段的特征向量
+        combined = torch.cat(band_vectors, dim=1)  # (batch, d_model * n_bands)
+        
+        # 提取特征（用于向量数据库）- 现在输出固定128维
+        self.extracted_features = self.feature_extractor(combined)  # (batch, 128)
+        
+        # 分类
+        out = self.classifier(combined)
+        return out
+    
+    def extract_features(self, x, feature_type='raw'):
+        """
+        提取特征向量（用于向量数据库）
+        
+        参数:
+        x: 输入数据
+        feature_type: 特征类型
+            - 'pre_classifier': 分类器前的特征 (d_model * n_bands)
+            - 'mamba': Mamba模块输出特征
+            - 'band_attention': 频段注意力特征
+            - 'temporal_attention': 时间注意力特征
+            - 'raw': 原始特征提取器输出（固定128维）
+        
+        返回:
+        特征向量
+        """
+        # 执行前向传播以计算所有中间特征
+        _ = self.forward(x)
+        
+        if feature_type == 'pre_classifier':
+            # 分类器前的特征
+            batch_size, _, total_channels, timepoints = x.shape
+            band_vectors = []
+            
+            for i in range(self.n_bands):
+                if self.n_bands > 1:
+                    start = i * self.raw_channels
+                    end = (i + 1) * self.raw_channels
+                    band_data = x[:, :, start:end, :]
+                else:
+                    band_data = x
+                
+                band_data = band_data.squeeze(1)
+                proj = self.band_projections[i](band_data)
+                proj = proj.transpose(1, 2)
+                mamba_out = self.band_mambas[i](proj)
+                
+                # 时间注意力池化
+                attn_weights = self.temporal_attention(mamba_out)
+                band_vector = torch.sum(mamba_out * attn_weights, dim=1)
+                band_vectors.append(band_vector)
+            
+            features = torch.cat(band_vectors, dim=1)
+            return features
+            
+        elif feature_type == 'mamba':
+            # Mamba模块输出特征（最后一个频段）
+            if self.n_bands > 1:
+                start = (self.n_bands - 1) * self.raw_channels
+                end = self.n_bands * self.raw_channels
+                band_data = x[:, :, start:end, :]
+            else:
+                band_data = x
+            
+            band_data = band_data.squeeze(1)
+            proj = self.band_projections[-1](band_data)
+            proj = proj.transpose(1, 2)
+            mamba_out = self.band_mambas[-1](proj)
+            
+            # 在时间维度上平均
+            features = mamba_out.mean(dim=1)
+            return features
+            
+        elif feature_type == 'band_attention' and self.n_bands > 1:
+            # 频段注意力特征
+            band_vectors = []
+            for i in range(self.n_bands):
+                if self.n_bands > 1:
+                    start = i * self.raw_channels
+                    end = (i + 1) * self.raw_channels
+                    band_data = x[:, :, start:end, :]
+                else:
+                    band_data = x
+                
+                band_data = band_data.squeeze(1)
+                proj = self.band_projections[i](band_data)
+                proj = proj.transpose(1, 2)
+                mamba_out = self.band_mambas[i](proj)
+                band_vector = mamba_out.mean(dim=1)
+                band_vectors.append(band_vector)
+            
+            # 应用跨频段注意力
+            band_vectors_stacked = torch.stack(band_vectors, dim=1)
+            attended_bands, _ = self.cross_band_attention(
+                band_vectors_stacked, band_vectors_stacked, band_vectors_stacked
+            )
+            
+            # 展平
+            features = attended_bands.flatten(1)
+            return features
+            
+        elif feature_type == 'temporal_attention':
+            # 时间注意力权重作为特征
+            batch_size, _, total_channels, timepoints = x.shape
+            temporal_features = []
+            
+            for i in range(self.n_bands):
+                if self.n_bands > 1:
+                    start = i * self.raw_channels
+                    end = (i + 1) * self.raw_channels
+                    band_data = x[:, :, start:end, :]
+                else:
+                    band_data = x
+                
+                band_data = band_data.squeeze(1)
+                proj = self.band_projections[i](band_data)
+                proj = proj.transpose(1, 2)
+                mamba_out = self.band_mambas[i](proj)
+                
+                # 获取时间注意力权重
+                attn_weights = self.temporal_attention(mamba_out)  # (batch, timepoints, 1)
+                temporal_features.append(attn_weights.squeeze(-1))
+            
+            # 拼接所有频段的时间注意力
+            features = torch.cat(temporal_features, dim=1)
+            return features
+            
+        else:
+            # 默认返回特征提取器输出（固定128维）
+            return self.extracted_features
+    
+    def get_attention_weights(self):
+        """
+        获取注意力权重（用于可视化）
+        
+        返回:
+        包含注意力权重的字典
+        """
+        attention_weights = {}
+        
+        if self.cross_band_attention_weights is not None:
+            attention_weights['cross_band'] = self.cross_band_attention_weights
+        
+        if self.temporal_attention_weights is not None:
+            attention_weights['temporal'] = self.temporal_attention_weights
+        
+        return attention_weights
+
 """针对多频段数据的专用Mamba网络（添加BatchNorm层）"""
 class MultiBandMambaNet(nn.Module):
     def __init__(self, n_channels, n_classes, n_timepoints, dropout=0.5, mamba_dim=32):
@@ -176,7 +474,47 @@ class MultiBandMambaNet(nn.Module):
         x = x.transpose(1, 2).unsqueeze(2)  # (batch, mamba_dim, 1, seq_len)
         out = self.classifier(x)
         return out
-
+    
+    def extract_features(self, x, feature_type='pre_classifier'):
+        """简化版特征提取"""
+        # 执行前向传播直到分类器前
+        raw_channels = x.size(2) // self.n_bands
+        
+        # 分离频段
+        band_features = []
+        for i in range(self.n_bands):
+            start_idx = i * raw_channels
+            end_idx = (i + 1) * raw_channels
+            band_data = x[:, :, start_idx:end_idx, :]
+            band_feat = self.band_convs[i](band_data)
+            band_features.append(band_feat)
+        
+        # 合并频段特征
+        x = torch.cat(band_features, dim=1)
+        
+        # 频段融合
+        x = self.band_fusion(x)
+        
+        # Mamba输入处理
+        if x.dim() == 4:
+            x = x.squeeze(2)
+        
+        # Mamba前的BatchNorm
+        x = self.before_mamba_bn(x)
+        
+        # 转置为Mamba需要的格式
+        x = x.transpose(1, 2)
+        
+        # Mamba前向传播
+        x = self.mamba(x)
+        
+        # Mamba后的BatchNorm
+        x = x.transpose(1, 2)
+        x = self.after_mamba_bn(x)
+        
+        # 全局平均池化
+        features = F.adaptive_avg_pool1d(x, 1).squeeze(-1)
+        return features
 
 """基线EEGNet（Shallow ConvNet）"""
 class BaselineEEGNet(nn.Module):
@@ -212,80 +550,42 @@ class BaselineEEGNet(nn.Module):
         x = torch.log(torch.clamp(x, min=1e-6))
         out = self.classifier(x)
         return out
+    
+    def extract_features(self, x, feature_type='pre_classifier'):
+        """提取特征"""
+        x = self.time_conv(x)
+        x = self.depthwise_conv(x)
+        x = self.bn2(x)
+        x = x * x
+        x = self.pool(x)
+        x = torch.log(torch.clamp(x, min=1e-6))
+        
+        # 展平作为特征
+        features = x.flatten(1)
+        return features
 
-class BandAwareInterpretableMamba(nn.Module):
-    """
-    频段感知可解释Mamba网络
-    设计原则：
-    1. 分离处理五个频段，每个频段使用独立的轻量级Mamba
-    2. 引入跨频段注意力机制，以捕捉频段间的相互作用
-    3. 使用注意力池化来聚合时间和通道维度，提高可解释性
-    4. 整体轻量化，减少过拟合风险
-    """
-    def __init__(self, n_channels=22, n_classes=4, n_timepoints=1125, 
-                 d_model=32, d_state=16, n_bands=5, dropout=0.5, use_freq=False):
-        super().__init__()
+class WidebandEEGNet(nn.Module):
+    """宽频带EEGNet（用于单频段数据）"""
+    def __init__(self, n_channels, n_classes, n_timepoints, use_freq=False, dropout=0.5):
+        super(WidebandEEGNet, self).__init__()
         
-        # 根据是否使用多频段滤波调整参数
-        if use_freq:
-            # 多频段模式下，输入通道数 = 原始通道数 × 频段数
-            self.n_bands = n_bands
-            self.raw_channels = n_channels // n_bands
-            print(f"多频段模式：原始通道数={self.raw_channels}, 频段数={n_bands}")
-        else:
-            # 单频段模式下，将所有通道作为一个频段处理
-            self.n_bands = 1
-            self.raw_channels = n_channels
-            print(f"单频段模式：通道数={self.raw_channels}")
+        # 简化结构
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=(1, 64), padding=(0, 32))
+        self.bn1 = nn.BatchNorm2d(8)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=(n_channels, 1))
+        self.bn2 = nn.BatchNorm2d(16)
+        self.pool = nn.AvgPool2d((1, 4))
         
-        self.d_model = d_model
-        self.n_bands = n_bands if use_freq else 1
+        # 计算特征维度
+        time_dim = (n_timepoints - 64 + 64) // 1  # 卷积后时间维度
+        time_dim = time_dim // 4  # 池化后时间维度
         
-        # 1. 每个频段的独立处理
-        self.band_projections = nn.ModuleList()
-        self.band_mambas = nn.ModuleList()
+        self.feature_dim = 16 * time_dim
         
-        for i in range(self.n_bands):
-            # 将每个频段的通道投影到d_model
-            proj = nn.Sequential(
-                nn.Conv1d(self.raw_channels, d_model, kernel_size=1, stride=1),
-                nn.BatchNorm1d(d_model),
-                nn.ELU(),
-                nn.Dropout(dropout)
-            )
-            self.band_projections.append(proj)
-            
-            # 每个频段一个Mamba（如果可用，否则用替代）
-            mamba = MambaWrapper(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=4,
-                expand=2
-            )
-            self.band_mambas.append(mamba)
-        
-        # 2. 频段间注意力机制（可选）
-        if self.n_bands > 1:
-            self.cross_band_attention = nn.MultiheadAttention(
-                embed_dim=d_model,
-                num_heads=4,
-                dropout=dropout,
-                batch_first=True
-            )
-        else:
-            self.cross_band_attention = None
-        
-        # 3. 时间注意力池化
-        self.temporal_attention = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.Tanh(),
-            nn.Linear(d_model // 2, 1),
-            nn.Softmax(dim=1)
-        )
-        
-        # 4. 分类头
         self.classifier = nn.Sequential(
-            nn.Linear(d_model * self.n_bands, 64),
+            nn.Dropout(dropout),
+            nn.Flatten(),
+            nn.Linear(self.feature_dim, 64),
             nn.BatchNorm1d(64),
             nn.ELU(),
             nn.Dropout(dropout),
@@ -293,60 +593,21 @@ class BandAwareInterpretableMamba(nn.Module):
         )
         
     def forward(self, x):
-        # x: (batch, 1, n_channels, n_timepoints)
-        batch_size, _, total_channels, timepoints = x.shape
+        x = F.elu(self.bn1(self.conv1(x)))
+        x = F.elu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        x = torch.log(torch.clamp(x, min=1e-6))
+        return self.classifier(x)
+    
+    def extract_features(self, x, feature_type='pre_classifier'):
+        """提取特征"""
+        x = F.elu(self.bn1(self.conv1(x)))
+        x = F.elu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        x = torch.log(torch.clamp(x, min=1e-6))
         
-        # 分割频段
-        band_features = []
-        for i in range(self.n_bands):
-            if self.n_bands > 1:
-                start = i * self.raw_channels
-                end = (i + 1) * self.raw_channels
-                band_data = x[:, :, start:end, :]  # (batch, 1, raw_channels, timepoints)
-            else:
-                # 单频段模式，使用所有通道
-                band_data = x
-            
-            band_data = band_data.squeeze(1)    # (batch, raw_channels, timepoints)
-            
-            # 频段投影
-            proj = self.band_projections[i](band_data)  # (batch, d_model, timepoints)
-            proj = proj.transpose(1, 2)                 # (batch, timepoints, d_model)
-            
-            # Mamba处理
-            mamba_out = self.band_mambas[i](proj)      # (batch, timepoints, d_model)
-            band_features.append(mamba_out)
-        
-        # 如果有多频段且使用跨频段注意力
-        if self.n_bands > 1 and self.cross_band_attention is not None:
-            # 将每个频段在时间维度上平均，然后进行跨频段注意力
-            band_vectors = [bf.mean(dim=1) for bf in band_features]  # 每个形状: (batch, d_model)
-            band_vectors_stacked = torch.stack(band_vectors, dim=1)  # (batch, n_bands, d_model)
-            
-            # 跨频段注意力
-            attended_bands, _ = self.cross_band_attention(
-                band_vectors_stacked, band_vectors_stacked, band_vectors_stacked
-            )  # (batch, n_bands, d_model)
-            
-            # 将注意力后的频段特征重新分配到时间维度
-            for i in range(self.n_bands):
-                # 将注意力权重应用到原始特征
-                attention_weight = attended_bands[:, i:i+1, :]  # (batch, 1, d_model)
-                band_features[i] = band_features[i] * attention_weight
-        
-        # 对每个频段进行时间注意力池化
-        band_vectors = []
-        for i in range(self.n_bands):
-            attn_weights = self.temporal_attention(band_features[i])  # (batch, timepoints, 1)
-            band_vector = torch.sum(band_features[i] * attn_weights, dim=1)  # (batch, d_model)
-            band_vectors.append(band_vector)
-        
-        # 拼接所有频段的特征向量
-        combined = torch.cat(band_vectors, dim=1)  # (batch, d_model * n_bands)
-        
-        # 分类
-        out = self.classifier(combined)
-        return out
+        features = x.flatten(1)
+        return features
 
 # 修改 get_model 函数
 def get_model(model_name, n_channels, n_classes, n_timepoints, use_freq=False, 

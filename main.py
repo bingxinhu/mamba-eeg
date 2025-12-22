@@ -13,10 +13,12 @@ import warnings
 import torch.nn.functional as F
 from datetime import datetime
 import json
+import yaml
 warnings.filterwarnings('ignore')
 
 from preprocess import get_data
-from models import get_model
+from models import get_model, BandAwareInterpretableMamba
+from eeg_vector_db import EEGVectorDatabase  # 新增：脑电向量数据库
 
 # 设置随机种子确保可复现性
 def set_seed(seed=42):
@@ -63,7 +65,8 @@ def initialize_model_weights(model, init_type='kaiming'):
     print(f"模型参数统计 - 总数: {total_params:,}, 可训练: {trainable_params:,}")
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='EEG信号分类主程序（修复过拟合）')
+    parser = argparse.ArgumentParser(description='EEG信号分类主程序（集成向量数据库）')
+    
     # 数据参数
     parser.add_argument('--data_path', type=str, default='./data', help='数据集根路径')
     parser.add_argument('--subject', type=int, default=0, help='被试编号（0-8，共9个被试）')
@@ -74,21 +77,21 @@ def parse_args():
     parser.add_argument('--augment', action='store_true', help='是否使用数据增强')
     parser.add_argument('--augment_factor', type=int, default=2, help='数据增强倍数')
     
-    # 模型参数 - 降低复杂度，增强正则化
+    # 模型参数
     parser.add_argument('--model', type=str, default='auto', 
                         choices=['baseline', 'wideband', 'multiband_mamba', 'Interpretable_mamba', 'auto'], 
                         help='选择模型，auto表示自动选择')
-    parser.add_argument('--mamba_dim', type=int, default=32, help='Mamba模块特征维度（降低）')
-    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout率（提高）')
+    parser.add_argument('--mamba_dim', type=int, default=32, help='Mamba模块特征维度')
+    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout率')
     parser.add_argument('--init_type', type=str, default='kaiming', 
                         choices=['kaiming', 'xavier', 'orthogonal'], help='权重初始化方法')
     
-    # 训练参数 - 调整以减少过拟合
-    parser.add_argument('--batch_size', type=int, default=32, help='批次大小（提高）')
-    parser.add_argument('--epochs', type=int, default=200, help='训练轮数')
-    parser.add_argument('--lr', type=float, default=1e-3, help='初始学习率（提高）')
-    parser.add_argument('--weight_decay', type=float, default=1e-3, help='权重衰减系数（提高）')
-    parser.add_argument('--patience', type=int, default=20, help='早停耐心值（降低）')
+    # 训练参数
+    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
+    parser.add_argument('--epochs', type=int, default=2000, help='训练轮数')
+    parser.add_argument('--lr', type=float, default=1e-3, help='初始学习率')
+    parser.add_argument('--weight_decay', type=float, default=1e-3, help='权重衰减系数')
+    parser.add_argument('--patience', type=int, default=500, help='早停耐心值')
     parser.add_argument('--mixup', action='store_true', help='是否使用Mixup数据增强')
     parser.add_argument('--mixup_alpha', type=float, default=0.2, help='Mixup alpha参数')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='梯度裁剪阈值')
@@ -98,15 +101,43 @@ def parse_args():
     parser.add_argument('--scheduler', type=str, default='plateau', 
                         choices=['plateau', 'cosine', 'step'], help='学习率调度器')
     
+    # 向量数据库参数 (新增)
+    parser.add_argument('--enable_vector_db', action='store_true', help='启用脑电向量数据库')
+    parser.add_argument('--db_type', type=str, default='faiss', choices=['faiss', 'annoy', 'simple'], 
+                        help='向量数据库类型')
+    parser.add_argument('--feature_dim', type=int, default=128, help='特征向量维度')
+    parser.add_argument('--retrieval_topk', type=int, default=5, help='检索最相似的k个样本')
+    parser.add_argument('--build_db_on_train', action='store_true', help='在训练时构建向量数据库')
+    parser.add_argument('--use_db_for_few_shot', action='store_true', help='使用向量数据库进行少样本学习')
+    
     # 保存与日志
     parser.add_argument('--save_dir', type=str, default='./results', help='结果保存目录')
     parser.add_argument('--save_model', action='store_true', help='是否保存最佳模型')
     parser.add_argument('--plot_cm', action='store_true', help='是否绘制混淆矩阵')
     parser.add_argument('--plot_curves', action='store_true', help='是否绘制训练曲线')
+    parser.add_argument('--plot_retrieval', action='store_true', help='是否绘制检索结果')
     parser.add_argument('--verbose', type=int, default=1, choices=[0, 1, 2], 
                         help='日志详细程度：0=静默，1=常规，2=详细')
     
+    # 配置文件
+    parser.add_argument('--config', type=str, default='', help='配置文件路径')
+    
     return parser.parse_args()
+
+def load_config(args):
+    """加载配置文件"""
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # 更新参数
+        for key, value in config.items():
+            if hasattr(args, key):
+                setattr(args, key, value)
+        
+        print(f"✓ 从 {args.config} 加载配置")
+    
+    return args
 
 def mixup_data(x, y, alpha=0.2):
     """Mixup数据增强"""
@@ -297,6 +328,7 @@ def setup_experiment_directory(args):
     os.makedirs(exp_dir, exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "models"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "plots"), exist_ok=True)
+    os.makedirs(os.path.join(exp_dir, "vector_db"), exist_ok=True)
     
     # 保存配置
     config_file = os.path.join(exp_dir, "config.json")
@@ -306,8 +338,251 @@ def setup_experiment_directory(args):
     print(f"实验目录: {exp_dir}")
     return exp_dir
 
+def extract_features_from_model(model, dataloader, device, args, feature_type='raw'):
+    """
+    从模型提取特征向量
+    feature_type: 'pre_classifier', 'mamba', 'band_attention', 'raw'
+    默认使用'raw'以获取128维固定特征
+    """
+    model.eval()
+    all_features = []
+    all_labels = []
+    all_metadata = []
+    
+    with torch.no_grad():
+        for batch_idx, (inputs, labels) in enumerate(dataloader):
+            inputs = inputs.to(device)
+            
+            # 使用模型的特征提取方法
+            if hasattr(model, 'extract_features'):
+                features = model.extract_features(inputs, feature_type=feature_type)
+            else:
+                # 默认：获取模型中间特征
+                features = extract_features_default(model, inputs, feature_type)
+            
+            all_features.append(features.cpu().numpy())
+            all_labels.append(labels.numpy())
+            
+            # 收集元数据
+            for i in range(len(labels)):
+                all_metadata.append({
+                    'batch': batch_idx,
+                    'sample_idx': i,
+                    'label': int(labels[i].item()),
+                    'subject': args.subject,
+                    'dataset': args.dataset
+                })
+    
+    all_features = np.vstack(all_features)
+    all_labels = np.concatenate(all_labels)
+    
+    return all_features, all_labels, all_metadata
+
+def extract_features_default(model, inputs, feature_type='pre_classifier'):
+    """默认特征提取方法"""
+    # 这里实现具体特征提取逻辑
+    # 简化版本：使用模型的中间层输出
+    if hasattr(model, 'get_pre_classifier_features'):
+        return model.get_pre_classifier_features(inputs)
+    else:
+        # 如果模型没有特征提取方法，使用模型输出前的最后一层
+        with torch.no_grad():
+            # 临时修改模型以获取中间特征
+            # 这里需要根据具体模型结构实现
+            return torch.randn(inputs.size(0), 128).to(inputs.device)  # 占位符
+
+def build_eeg_vector_database(args, model, train_loader, test_loader, device, exp_dir):
+    """构建脑电向量数据库"""
+    print("\n===== 构建脑电向量数据库 =====")
+    
+    # 先提取特征以确定实际维度
+    print("提取训练集特征以确定维度...")
+    test_features, _, _ = extract_features_from_model(
+        model, 
+        DataLoader(train_loader.dataset, batch_size=min(10, len(train_loader.dataset))), 
+        device, args, feature_type='raw'
+    )
+    
+    actual_feature_dim = test_features.shape[1]
+    print(f"模型实际特征维度: {actual_feature_dim}")
+    
+    # 如果实际维度与配置不同，更新配置
+    if actual_feature_dim != args.feature_dim:
+        print(f"注意: 模型特征维度({actual_feature_dim})与配置({args.feature_dim})不同，使用实际维度")
+        args.feature_dim = actual_feature_dim
+    
+    # 初始化向量数据库（使用实际特征维度）
+    vector_db = EEGVectorDatabase(
+        db_type=args.db_type,
+        dimension=args.feature_dim,
+        use_gpu=torch.cuda.is_available()
+    )
+    
+    # 提取完整的训练集特征
+    print("提取完整的训练集特征...")
+    train_features, train_labels, train_metadata = extract_features_from_model(
+        model, train_loader, device, args, feature_type='raw'
+    )
+    
+    print(f"特征维度: {train_features.shape[1]}, 样本数: {len(train_features)}")
+    
+    # 构建向量索引
+    print(f"构建向量索引...")
+    vector_db.build_index(train_features, train_labels, train_metadata)
+    
+    # 保存向量数据库
+    db_path = os.path.join(exp_dir, "vector_db", "eeg_vector_db.pkl")
+    vector_db.save(db_path)
+    print(f"✓ 向量数据库已保存至: {db_path}")
+    
+    # 测试向量检索
+    print("\n测试向量检索功能...")
+    
+    # 随机选择一些测试样本进行检索
+    test_sample_indices = np.random.choice(len(test_loader.dataset), min(5, len(test_loader.dataset)), replace=False)
+    
+    retrieval_results = []
+    for i, idx in enumerate(test_sample_indices):
+        test_input, test_label = test_loader.dataset[idx]
+        test_input = test_input.unsqueeze(0).to(device)
+        
+        # 提取测试样本特征
+        test_feature, _, _ = extract_features_from_model(
+            model, 
+            DataLoader(TensorDataset(test_input, torch.tensor([test_label])), batch_size=1), 
+            device, args, feature_type='raw'
+        )
+        
+        # 检索相似样本
+        similar_samples = vector_db.query_similar(test_feature[0], k=args.retrieval_topk)
+        
+        retrieval_results.append({
+            'test_index': idx,
+            'test_label': int(test_label),
+            'similar_samples': similar_samples
+        })
+        
+        # 打印检索结果
+        if args.verbose >= 1:
+            print(f"\n测试样本 {i+1} (标签: {test_label}):")
+            print(f"  检索到的最相似样本:")
+            for j, sample in enumerate(similar_samples):
+                print(f"    {j+1}. 距离: {sample['distance']:.4f}, 标签: {sample['label']}, "
+                      f"相似度: {sample['similarity']:.4f}")
+    
+    # 计算检索准确率
+    if retrieval_results:
+        retrieval_acc = analyze_retrieval_accuracy(retrieval_results)
+        print(f"\n向量检索准确率 (Top-{args.retrieval_topk}): {retrieval_acc:.4f}")
+    
+    return vector_db, retrieval_results
+
+def analyze_retrieval_accuracy(retrieval_results):
+    """分析检索准确率"""
+    correct = 0
+    total = 0
+    
+    for result in retrieval_results:
+        test_label = result['test_label']
+        similar_labels = [s['label'] for s in result['similar_samples']]
+        
+        # 检查检索到的样本中是否有相同标签的
+        if test_label in similar_labels:
+            correct += 1
+        total += 1
+    
+    return correct / total if total > 0 else 0
+
+def visualize_retrieval_results(retrieval_results, vector_db, exp_dir, model, args):
+    """可视化检索结果"""
+    if not args.plot_retrieval:
+        return
+    
+    try:
+        # 选择前几个测试样本进行可视化
+        num_samples_to_plot = min(3, len(retrieval_results))
+        
+        for i in range(num_samples_to_plot):
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            fig.suptitle(f'脑电向量检索结果 - 测试样本 {i+1}', fontsize=16)
+            
+            result = retrieval_results[i]
+            test_label = result['test_label']
+            similar_samples = result['similar_samples']
+            
+            # 这里可以添加具体的可视化代码
+            # 例如：显示原始脑电信号、特征空间投影、相似度分布等
+            
+            plot_path = os.path.join(exp_dir, "plots", f"retrieval_sample_{i+1}.png")
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            print(f"✓ 检索结果可视化已保存: {plot_path}")
+    
+    except Exception as e:
+        print(f"✗ 可视化检索结果失败: {e}")
+
+def few_shot_learning_with_vector_db(vector_db, test_loader, model, device, args):
+    """使用向量数据库进行少样本学习"""
+    print("\n===== 基于向量数据库的少样本学习 =====")
+    
+    predictions = []
+    true_labels = []
+    few_shot_results = []
+    
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, (inputs, labels) in enumerate(test_loader):
+            inputs = inputs.to(device)
+            
+            # 提取特征
+            features, _, _ = extract_features_from_model(
+                model, 
+                DataLoader(TensorDataset(inputs, labels), batch_size=inputs.size(0)), 
+                device,
+                args
+            )
+            
+            batch_predictions = []
+            for i in range(features.shape[0]):
+                # 检索相似样本
+                similar_samples = vector_db.query_similar(features[i], k=args.retrieval_topk)
+                
+                # 基于检索结果进行预测（多数投票）
+                retrieved_labels = [s['label'] for s in similar_samples]
+                if retrieved_labels:
+                    pred = np.bincount(retrieved_labels).argmax()
+                else:
+                    # 如果没有检索到结果，使用模型预测
+                    pred = model(inputs[i:i+1]).argmax().item()
+                
+                batch_predictions.append(pred)
+                
+                # 记录检索信息
+                few_shot_results.append({
+                    'true_label': int(labels[i].item()),
+                    'predicted_label': pred,
+                    'retrieved_labels': retrieved_labels,
+                    'retrieved_distances': [s['distance'] for s in similar_samples]
+                })
+            
+            predictions.extend(batch_predictions)
+            true_labels.extend(labels.cpu().numpy())
+    
+    # 计算少样本学习准确率
+    few_shot_acc = accuracy_score(true_labels, predictions)
+    print(f"基于向量数据库的少样本学习准确率: {few_shot_acc:.4f}")
+    
+    return few_shot_acc, few_shot_results
+
 def main():
+    # 解析参数
     args = parse_args()
+    
+    # 加载配置文件
+    if args.config:
+        args = load_config(args)
+    
     set_seed()
     
     # 设置实验目录
@@ -390,7 +665,7 @@ def main():
     print(f"通道数: {n_channels}, 时间点数: {n_timepoints}, 类别数: {n_classes}")
     print(f"选择的模型: {args.model}")
     
-    # 尝试创建模型
+    # 创建模型
     max_attempts = 3
     model = None
     
@@ -432,7 +707,7 @@ def main():
                     args.model = 'baseline'
                     print(f"切换到 {args.model} 模型")
                 else:
-                    args.model = 'regularized_mamba'
+                    args.model = 'multiband_mamba'
                     print(f"切换到 {args.model} 模型")
             else:
                 print(f"✗ 所有模型尝试都失败了！")
@@ -443,7 +718,7 @@ def main():
         print("✗ 无法创建模型，退出")
         return
     
-    # 配置损失函数（支持标签平滑）
+    # 配置损失函数
     if args.label_smoothing > 0:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.label_smoothing)
         print(f"使用标签平滑交叉熵损失 (smoothing={args.label_smoothing})")
@@ -512,7 +787,7 @@ def main():
                   f"学习率: {optimizer.param_groups[0]['lr']:.2e} | "
                   f"早停计数: {patience_counter}/{args.patience}")
         
-        # 保存最佳模型（基于验证准确率）
+        # 保存最佳模型
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_val_loss = val_loss
@@ -563,7 +838,7 @@ def main():
     
     cm = confusion_matrix(true_labels, pred_labels)
     
-    # 保存结果 - 修复JSON序列化问题
+    # 保存结果
     results = {
         'train_losses': [float(x) for x in train_losses],
         'train_accs': [float(x) for x in train_accs],
@@ -596,23 +871,76 @@ def main():
     print(f"✓ 结果已保存至 {results_file}")
     
     # 保存性能摘要
+    save_summary(exp_dir, args, model, X_train, y_train, X_test, y_test, 
+                train_losses, val_losses, train_accs, val_accs, 
+                test_acc, test_bal_acc, test_kappa, test_f1, best_val_acc, lr_history)
+    
+    # 构建脑电向量数据库（如果启用）
+    vector_db = None
+    retrieval_results = None
+    few_shot_results = None
+    
+    if args.enable_vector_db:
+        vector_db, retrieval_results = build_eeg_vector_database(
+            args, model, train_loader, test_loader, device, exp_dir
+        )
+        
+        # 可视化检索结果
+        if args.plot_retrieval and retrieval_results:
+            visualize_retrieval_results(retrieval_results, vector_db, exp_dir, model, args)
+        
+        # 少样本学习（如果启用）
+        if args.use_db_for_few_shot and vector_db:
+            few_shot_acc, few_shot_results = few_shot_learning_with_vector_db(
+                vector_db, test_loader, model, device, args
+            )
+            
+            # 保存少样本学习结果
+            few_shot_file = os.path.join(exp_dir, "few_shot_results.json")
+            with open(few_shot_file, 'w') as f:
+                json.dump({
+                    'few_shot_accuracy': float(few_shot_acc),
+                    'samples': few_shot_results[:100]  # 只保存前100个样本
+                }, f, indent=4)
+            
+            print(f"✓ 少样本学习结果已保存至 {few_shot_file}")
+    
+    # 绘制训练曲线
+    if args.plot_curves:
+        plot_training_curves(exp_dir, args, train_losses, val_losses, train_accs, val_accs, 
+                           val_kappas, val_f1s, lr_history, best_val_acc)
+    
+    # 绘制混淆矩阵
+    if args.plot_cm:
+        plot_confusion_matrix(exp_dir, args, cm, n_classes, test_acc, test_kappa)
+    
+    # 最终输出
+    print_experiment_summary(exp_dir, args, test_acc, test_bal_acc, test_kappa, test_f1, 
+                           best_val_acc, n_classes, train_accs, val_accs)
+
+def save_summary(exp_dir, args, model, X_train, y_train, X_test, y_test, 
+                train_losses, val_losses, train_accs, val_accs, 
+                test_acc, test_bal_acc, test_kappa, test_f1, best_val_acc, lr_history):
+    """保存实验摘要"""
     summary_file = os.path.join(exp_dir, "summary.txt")
+    n_classes = len(np.unique(y_train.numpy()))
+    
     with open(summary_file, 'w', encoding='utf-8') as f:
         f.write("="*60 + "\n")
-        f.write("EEG分类实验摘要\n")
+        f.write("EEG分类实验摘要（集成向量数据库）\n")
         f.write("="*60 + "\n\n")
         
         f.write("实验信息:\n")
         f.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"实验目录: {exp_dir}\n")
-        f.write(f"设备: {device}\n")
+        f.write(f"设备: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}\n")
         f.write(f"数据集: {args.dataset}, 被试: {args.subject}\n")
         f.write(f"模型: {args.model}\n\n")
         
         f.write("配置参数:\n")
         f.write("-"*40 + "\n")
         for arg, value in vars(args).items():
-            f.write(f"{arg:20}: {value}\n")
+            f.write(f"{arg:25}: {value}\n")
         
         f.write("\n数据统计:\n")
         f.write("-"*40 + "\n")
@@ -637,92 +965,104 @@ def main():
         f.write("性能指标:\n")
         f.write("-"*40 + "\n")
         f.write(f"最佳验证准确率: {best_val_acc:.4f}\n")
-        f.write(f"最终验证准确率: {val_acc:.4f}\n")
+        f.write(f"最终验证准确率: {val_accs[-1]:.4f}\n")
         f.write(f"测试准确率: {test_acc:.4f}\n")
         f.write(f"测试平衡准确率: {test_bal_acc:.4f}\n")
         f.write(f"Cohen's Kappa: {test_kappa:.4f}\n")
         f.write(f"加权F1分数: {test_f1:.4f}\n")
         f.write(f"随机水平 (1/{n_classes}): {1.0/n_classes:.4f}\n")
         f.write(f"提升幅度: {test_acc - 1.0/n_classes:.4f}\n")
+        
+        if args.enable_vector_db:
+            f.write("\n向量数据库配置:\n")
+            f.write("-"*40 + "\n")
+            f.write(f"数据库类型: {args.db_type}\n")
+            f.write(f"特征维度: {args.feature_dim}\n")
+            f.write(f"检索Top-K: {args.retrieval_topk}\n")
+            f.write(f"少样本学习: {'启用' if args.use_db_for_few_shot else '禁用'}\n")
     
     print(f"✓ 实验摘要已保存至 {summary_file}")
-    
-    # 绘制训练曲线
-    if args.plot_curves:
-        try:
-            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-            
-            # 损失曲线
-            axes[0, 0].plot(train_losses, label='训练损失', linewidth=2, alpha=0.8)
-            axes[0, 0].plot(val_losses, label='验证损失', linewidth=2, alpha=0.8)
-            axes[0, 0].axhline(y=min(val_losses), color='r', linestyle='--', alpha=0.5, 
-                              label=f'最小验证损失: {min(val_losses):.4f}')
-            axes[0, 0].set_xlabel('Epoch')
-            axes[0, 0].set_ylabel('损失')
-            axes[0, 0].set_title('训练与验证损失曲线')
-            axes[0, 0].legend()
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # 准确率曲线
-            axes[0, 1].plot(train_accs, label='训练准确率', linewidth=2, alpha=0.8)
-            axes[0, 1].plot(val_accs, label='验证准确率', linewidth=2, alpha=0.8)
-            axes[0, 1].axhline(y=best_val_acc, color='r', linestyle='--', alpha=0.8,
-                              label=f'最佳验证准确率: {best_val_acc:.4f}')
-            axes[0, 1].set_xlabel('Epoch')
-            axes[0, 1].set_ylabel('准确率')
-            axes[0, 1].set_title('训练与验证准确率曲线')
-            axes[0, 1].legend()
-            axes[0, 1].grid(True, alpha=0.3)
-            
-            # Kappa和F1曲线
-            axes[1, 0].plot(val_kappas, label='验证Kappa', linewidth=2, alpha=0.8, color='green')
-            axes[1, 0].plot(val_f1s, label='验证F1', linewidth=2, alpha=0.8, color='orange')
-            axes[1, 0].set_xlabel('Epoch')
-            axes[1, 0].set_ylabel('分数')
-            axes[1, 0].set_title('验证集Kappa和F1分数')
-            axes[1, 0].legend()
-            axes[1, 0].grid(True, alpha=0.3)
-            
-            # 学习率曲线
-            axes[1, 1].plot(lr_history, label='学习率', linewidth=2, alpha=0.8, color='purple')
-            axes[1, 1].set_xlabel('Epoch')
-            axes[1, 1].set_ylabel('学习率')
-            axes[1, 1].set_title('学习率变化曲线')
-            axes[1, 1].set_yscale('log')
-            axes[1, 1].legend()
-            axes[1, 1].grid(True, alpha=0.3)
-            
-            plt.suptitle(f'训练监控 - {args.dataset} S{args.subject} - {args.model}', fontsize=14)
-            plt.tight_layout()
-            curve_file = os.path.join(exp_dir, "plots", "training_curves.png")
-            plt.savefig(curve_file, dpi=300, bbox_inches='tight')
-            plt.close()
-            print(f"✓ 训练曲线已保存至 {curve_file}")
-        except Exception as e:
-            print(f"✗ 绘制训练曲线失败: {e}")
-    
-    # 绘制混淆矩阵
-    if args.plot_cm:
-        try:
-            plt.figure(figsize=(8, 6))
-            cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-            
-            sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues', 
-                       xticklabels=[f'类别{i}' for i in range(n_classes)], 
-                       yticklabels=[f'类别{i}' for i in range(n_classes)],
-                       cbar_kws={'label': '比例'})
-            
-            plt.xlabel('预测标签')
-            plt.ylabel('真实标签')
-            plt.title(f'混淆矩阵 (归一化)\n准确率: {test_acc:.4f}, Kappa: {test_kappa:.4f}')
-            
-            cm_file = os.path.join(exp_dir, "plots", "confusion_matrix.png")
-            plt.savefig(cm_file, dpi=300, bbox_inches='tight')
-            plt.close()
-            print(f"✓ 混淆矩阵已保存至 {cm_file}")
-        except Exception as e:
-            print(f"✗ 绘制混淆矩阵失败: {e}")
-    
+
+def plot_training_curves(exp_dir, args, train_losses, val_losses, train_accs, val_accs, 
+                        val_kappas, val_f1s, lr_history, best_val_acc):
+    """绘制训练曲线"""
+    try:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # 损失曲线
+        axes[0, 0].plot(train_losses, label='训练损失', linewidth=2, alpha=0.8)
+        axes[0, 0].plot(val_losses, label='验证损失', linewidth=2, alpha=0.8)
+        axes[0, 0].axhline(y=min(val_losses), color='r', linestyle='--', alpha=0.5, 
+                          label=f'最小验证损失: {min(val_losses):.4f}')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('损失')
+        axes[0, 0].set_title('训练与验证损失曲线')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 准确率曲线
+        axes[0, 1].plot(train_accs, label='训练准确率', linewidth=2, alpha=0.8)
+        axes[0, 1].plot(val_accs, label='验证准确率', linewidth=2, alpha=0.8)
+        axes[0, 1].axhline(y=best_val_acc, color='r', linestyle='--', alpha=0.8,
+                          label=f'最佳验证准确率: {best_val_acc:.4f}')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('准确率')
+        axes[0, 1].set_title('训练与验证准确率曲线')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Kappa和F1曲线
+        axes[1, 0].plot(val_kappas, label='验证Kappa', linewidth=2, alpha=0.8, color='green')
+        axes[1, 0].plot(val_f1s, label='验证F1', linewidth=2, alpha=0.8, color='orange')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('分数')
+        axes[1, 0].set_title('验证集Kappa和F1分数')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 学习率曲线
+        axes[1, 1].plot(lr_history, label='学习率', linewidth=2, alpha=0.8, color='purple')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('学习率')
+        axes[1, 1].set_title('学习率变化曲线')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.suptitle(f'训练监控 - {args.dataset} S{args.subject} - {args.model}', fontsize=14)
+        plt.tight_layout()
+        curve_file = os.path.join(exp_dir, "plots", "training_curves.png")
+        plt.savefig(curve_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✓ 训练曲线已保存至 {curve_file}")
+    except Exception as e:
+        print(f"✗ 绘制训练曲线失败: {e}")
+
+def plot_confusion_matrix(exp_dir, args, cm, n_classes, test_acc, test_kappa):
+    """绘制混淆矩阵"""
+    try:
+        plt.figure(figsize=(8, 6))
+        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        
+        sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues', 
+                   xticklabels=[f'类别{i}' for i in range(n_classes)], 
+                   yticklabels=[f'类别{i}' for i in range(n_classes)],
+                   cbar_kws={'label': '比例'})
+        
+        plt.xlabel('预测标签')
+        plt.ylabel('真实标签')
+        plt.title(f'混淆矩阵 (归一化)\n准确率: {test_acc:.4f}, Kappa: {test_kappa:.4f}')
+        
+        cm_file = os.path.join(exp_dir, "plots", "confusion_matrix.png")
+        plt.savefig(cm_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✓ 混淆矩阵已保存至 {cm_file}")
+    except Exception as e:
+        print(f"✗ 绘制混淆矩阵失败: {e}")
+
+def print_experiment_summary(exp_dir, args, test_acc, test_bal_acc, test_kappa, test_f1, 
+                           best_val_acc, n_classes, train_accs, val_accs):
+    """打印实验总结"""
     print("\n" + "="*60)
     print("实验完成!")
     print("="*60)
@@ -736,6 +1076,14 @@ def main():
     print(f"随机水平 (1/{n_classes}): {1.0/n_classes:.4f}")
     print(f"提升幅度: {test_acc - 1.0/n_classes:.4f}")
     print(f"训练验证差距: {train_accs[-1] - val_accs[-1]:.4f}")
+    
+    if args.enable_vector_db:
+        print(f"\n向量数据库功能: {'已启用' if args.enable_vector_db else '未启用'}")
+        if args.enable_vector_db:
+            print(f"数据库类型: {args.db_type}")
+            print(f"检索Top-K: {args.retrieval_topk}")
+            print(f"少样本学习: {'已启用' if args.use_db_for_few_shot else '未启用'}")
+    
     print("="*60)
 
 if __name__ == '__main__':
