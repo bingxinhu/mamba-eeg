@@ -83,6 +83,7 @@ def parse_args():
                         help='选择模型，auto表示自动选择')
     parser.add_argument('--mamba_dim', type=int, default=32, help='Mamba模块特征维度')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout率')
+    parser.add_argument('--n_attention_heads', type=int, default=8, help='注意力头数')
     parser.add_argument('--init_type', type=str, default='kaiming', 
                         choices=['kaiming', 'xavier', 'orthogonal'], help='权重初始化方法')
     

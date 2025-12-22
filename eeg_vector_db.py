@@ -254,10 +254,13 @@ class EEGVectorDatabase:
     
     def _initialize_index(self):
         """初始化向量索引"""
+        original_db_type = self.db_type
+        
         if self.db_type == "faiss":
             if not FAISS_AVAILABLE:
                 warnings.warn("Faiss not available, falling back to simple index")
                 self.db_type = "simple"
+                self.index = SimpleVectorIndex(self.dimension)
             else:
                 index_type = self.index_params.get('index_type', 'flat')
                 self.index = FaissIndex(self.dimension, self.use_gpu, index_type)
@@ -266,6 +269,7 @@ class EEGVectorDatabase:
             if not ANNOY_AVAILABLE:
                 warnings.warn("Annoy not available, falling back to simple index")
                 self.db_type = "simple"
+                self.index = SimpleVectorIndex(self.dimension)
             else:
                 n_trees = self.index_params.get('n_trees', 10)
                 metric = self.index_params.get('metric', 'euclidean')
@@ -276,6 +280,10 @@ class EEGVectorDatabase:
         
         else:
             raise ValueError(f"Unsupported database type: {self.db_type}")
+        
+        # 如果数据库类型被更改，记录日志
+        if original_db_type != self.db_type:
+            print(f"警告: 数据库类型从 {original_db_type} 更改为 {self.db_type}")
     
     def add_samples(self, 
                    vectors: np.ndarray,
@@ -340,6 +348,13 @@ class EEGVectorDatabase:
         
         # 构建索引
         print(f"构建 {self.db_type} 索引，样本数: {all_vectors.shape[0]}, 维度: {all_vectors.shape[1]}")
+        
+        # 确保索引对象已初始化
+        if self.index is None:
+            self._initialize_index()
+            if self.index is None:
+                raise RuntimeError("Failed to initialize vector index")
+        
         self.index.build(all_vectors)
         
         print(f"✓ 索引构建完成")
@@ -688,8 +703,11 @@ class EEGVectorDatabase:
         # 保存索引
         index_file = filepath.replace('.pkl', '_index')
         if self.index and self.index.is_built:
-            self.index.save(index_file)
-            data['index_file'] = index_file
+            try:
+                self.index.save(index_file)
+                data['index_file'] = index_file
+            except Exception as e:
+                print(f"警告: 保存索引失败: {e}")
         
         # 保存数据
         with open(filepath, 'wb') as f:
@@ -727,7 +745,11 @@ class EEGVectorDatabase:
         # 加载索引
         index_file = data.get('index_file')
         if index_file and os.path.exists(index_file):
-            self.index.load(index_file)
+            try:
+                self.index.load(index_file)
+                print(f"✓ 向量索引已从 {index_file} 加载")
+            except Exception as e:
+                print(f"警告: 加载向量索引失败: {e}")
         
         print(f"✓ 向量数据库已从 {filepath} 加载")
         print(f"  样本数: {self.stats['n_samples']}, 类别数: {self.stats['n_classes']}")

@@ -8,39 +8,40 @@ loso: false
 no_standard: false
 fre_filter: true
 augment: true
-augment_factor: 2
+augment_factor: 3
 
 # 模型参数
 model: "Interpretable_mamba"
 mamba_dim: 128
 dropout: 0.3
+n_attention_heads: 8
 init_type: "kaiming"
 
 # 训练参数
-batch_size: 128
-epochs: 2000
-lr: 0.001
-weight_decay: 0.01
-patience: 300
+batch_size: 32
+epochs: 3000
+lr: 0.0008
+weight_decay: 0.005
+patience: 500
 mixup: true
-mixup_alpha: 0.4
-grad_clip: 1.0
-label_smoothing: 0.1
+mixup_alpha: 0.3
+grad_clip: 0.5
+label_smoothing: 0.05
 optimizer: "adamw"
 scheduler: "cosine"
 
 # 向量数据库参数
-enable_vector_db: true
+enable_vector_db: false
 db_type: "faiss"  # faiss, annoy, simple
-feature_dim: 128
+feature_dim: 256
 retrieval_topk: 10
-build_db_on_train: true
-use_db_for_few_shot: true
+# build_db_on_train: true
+# use_db_for_few_shot: true
 
 # 保存与日志
 save_dir: "./results"
 save_model: true
 plot_cm: true
 plot_curves: true
-plot_retrieval: true
+plot_retrieval: false
 verbose: 1
