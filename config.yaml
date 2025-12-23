@@ -2,7 +2,7 @@
 
 # 数据参数
 data_path: "./dataset/2a"
-subject: 0
+subject: 2
 dataset: "BCI2a"
 loso: false
 no_standard: false

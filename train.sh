@@ -5,7 +5,7 @@
 # 设置实验名称
 EXP_NAME="eeg_classification_with_vector_db"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXP_DIR="./experiments/${EXP_NAME}_${TIMESTAMP}"
+EXP_DIR="./result/${EXP_NAME}_${TIMESTAMP}"
 
 # 创建实验目录
 mkdir -p $EXP_DIR
@@ -17,37 +17,7 @@ echo "开始时间: $(date)"
 echo "========================================"
 
 # 使用配置文件运行
-python main.py \
-  --config ./config.yaml \
-  --save_dir $EXP_DIR \
-  --subject 0 \
-  --model Interpretable_mamba \
-  --mamba_dim 128 \
-  --batch_size 64 \
-  --dropout 0.3 \
-  --epochs 2000 \
-  --lr 1e-3 \
-  --weight_decay 0.01 \
-  --mixup \
-  --mixup_alpha 0.4 \
-  --grad_clip 1.0 \
-  --patience 500 \
-  --augment \
-  --augment_factor 3 \
-  --scheduler cosine \
-  --label_smoothing 0.15 \
-  --fre_filter \
-  --optimizer adamw \
-  --enable_vector_db \
-  --db_type faiss \
-  --feature_dim 128 \
-  --retrieval_topk 5 \
-  --use_db_for_few_shot \
-  --save_model \
-  --plot_curves \
-  --plot_cm \
-  --plot_retrieval \
-  --verbose 1
+python main.py --config ./config.yaml 
 
 # 复制配置文件到实验目录
 cp ./config.yaml $EXP_DIR/
