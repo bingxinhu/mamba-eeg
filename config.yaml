@@ -8,13 +8,13 @@ loso: false
 no_standard: false
 fre_filter: true
 augment: true
-augment_factor: 3
+augment_factor: 6
 
 # 模型参数
 model: "Interpretable_mamba"
 mamba_dim: 128
 dropout: 0.3
-n_attention_heads: 64
+n_attention_heads: 32
 init_type: "kaiming"
 
 # 训练参数
