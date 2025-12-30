@@ -22,7 +22,7 @@ batch_size: 32
 epochs: 3000
 lr: 0.0008
 weight_decay: 0.005
-patience: 500
+patience: 600
 mixup: true
 mixup_alpha: 0.3
 grad_clip: 0.5
@@ -31,7 +31,7 @@ optimizer: "adamw"
 scheduler: "cosine"
 
 # 向量数据库参数
-enable_vector_db: false
+enable_vector_db: true
 db_type: "faiss"  # faiss, annoy, simple
 feature_dim: 256
 retrieval_topk: 10
