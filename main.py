@@ -637,7 +637,8 @@ def main():
         batch_size=args.batch_size, 
         shuffle=True, 
         num_workers=2,
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        drop_last = True
     )
     test_loader = DataLoader(
         test_dataset, 

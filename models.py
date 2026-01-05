@@ -245,11 +245,11 @@ class BandAwareInterpretableMamba(nn.Module):
         # 特征提取层 - 固定输出维度为128以匹配向量数据库
         self.feature_extractor = nn.Sequential(
             nn.Linear(d_model * self.n_bands, 256),
-            nn.BatchNorm1d(256),
+            nn.BatchNorm1d(256, momentum=0.1, track_running_stats=True),
             nn.ELU(),
             nn.Dropout(dropout),
             nn.Linear(256, 128),  # 固定输出128维以匹配向量数据库
-            nn.BatchNorm1d(128),
+            nn.BatchNorm1d(128, momentum=0.1, track_running_stats=True),
             nn.Tanh()
         )
         

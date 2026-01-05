@@ -2,13 +2,13 @@
 
 # 数据参数
 data_path: "./dataset/2a"
-subject: 2
+subject: 4
 dataset: "BCI2a"
 loso: false
 no_standard: false
 fre_filter: true
 augment: true
-augment_factor: 6
+augment_factor: 8
 
 # 模型参数
 model: "Interpretable_mamba"
@@ -26,7 +26,7 @@ patience: 600
 mixup: true
 mixup_alpha: 0.3
 grad_clip: 0.5
-label_smoothing: 0.05
+label_smoothing: 0.1
 optimizer: "adamw"
 scheduler: "cosine"
 
