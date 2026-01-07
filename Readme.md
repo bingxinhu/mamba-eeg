@@ -23,3 +23,6 @@ from diagnosis_analysis import EEGSubjectDiagnosis
 diagnosis = EEGSubjectDiagnosis('./results', 1)
 diagnosis.load_results()
 diagnosis.generate_interactive_report()
+
+# 5. 可视化attention 
+python attention_visualization.py --subject 5 --model_path ./results/BCI2a_S5_Interpretable_mamba_20260107_090756/models/best_model.pth
