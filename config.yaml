@@ -2,7 +2,7 @@
 
 # 数据参数
 data_path: "./dataset/2a"
-subject: 4
+subject: 5
 dataset: "BCI2a"
 loso: false
 no_standard: false
@@ -13,18 +13,18 @@ augment_factor: 8
 # 模型参数
 model: "Interpretable_mamba"
 mamba_dim: 128
-dropout: 0.3
+dropout: 0.4
 n_attention_heads: 32
 init_type: "kaiming"
 
 # 训练参数
 batch_size: 32
 epochs: 3000
-lr: 0.0008
-weight_decay: 0.005
-patience: 600
+lr: 0.0005
+weight_decay: 0.01
+patience: 800
 mixup: true
-mixup_alpha: 0.3
+mixup_alpha: 0.4
 grad_clip: 0.5
 label_smoothing: 0.1
 optimizer: "adamw"
@@ -33,10 +33,10 @@ scheduler: "cosine"
 # 向量数据库参数
 enable_vector_db: true
 db_type: "faiss"  # faiss, annoy, simple
-feature_dim: 256
+feature_dim: 128
 retrieval_topk: 10
-# build_db_on_train: true
-# use_db_for_few_shot: true
+build_db_on_train: true
+use_db_for_few_shot: true
 
 # 保存与日志
 save_dir: "./results"

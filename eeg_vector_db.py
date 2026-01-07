@@ -22,6 +22,31 @@ except ImportError:
     ANNOY_AVAILABLE = False
     warnings.warn("Annoy not available. Install with: pip install annoy")
 
+def check_faiss_gpu_availability():
+    """检查Faiss GPU支持"""
+    if not FAISS_AVAILABLE:
+        return False, False
+    
+    has_gpu = False
+    has_gpu_api = False
+    
+    # 检查基本faiss
+    try:
+        import faiss
+        # 检查是否有GPU相关属性
+        has_gpu_api = hasattr(faiss, 'StandardGpuResources') or hasattr(faiss, 'index_cpu_to_gpu')
+        
+        # 检查GPU专用模块
+        try:
+            import faiss.contrib.gpu_resources as faiss_gpu
+            has_gpu = True
+        except (ImportError, AttributeError):
+            has_gpu = False
+            
+        return has_gpu, has_gpu_api
+    except Exception:
+        return False, False
+
 class BaseVectorIndex:
     """向量索引基类"""
     
@@ -47,12 +72,13 @@ class BaseVectorIndex:
         raise NotImplementedError
 
 class FaissIndex(BaseVectorIndex):
-    """Faiss向量索引"""
+    """Faiss向量索引（修复GPU支持）"""
     
     def __init__(self, dimension: int, use_gpu: bool = False, index_type: str = "flat"):
         super().__init__(dimension)
         self.use_gpu = use_gpu
         self.index_type = index_type
+        self.gpu_resources = None
         
     def build(self, vectors: np.ndarray):
         """构建Faiss索引"""
@@ -61,6 +87,7 @@ class FaissIndex(BaseVectorIndex):
         
         vectors = vectors.astype(np.float32)
         
+        # 创建索引
         if self.index_type == "flat":
             self.index = faiss.IndexFlatL2(self.dimension)
         elif self.index_type == "ivf":
@@ -73,12 +100,46 @@ class FaissIndex(BaseVectorIndex):
         else:
             raise ValueError(f"Unsupported index type: {self.index_type}")
         
-        if self.use_gpu and torch.cuda.is_available():
-            res = faiss.StandardGpuResources()
-            self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
+        # 安全的GPU检测和初始化
+        self._initialize_gpu_if_available(vectors)
         
+        # 添加向量到索引
         self.index.add(vectors)
         self.is_built = True
+    
+    def _initialize_gpu_if_available(self, vectors: np.ndarray):
+        """安全地初始化GPU支持"""
+        if not self.use_gpu:
+            return
+        
+        if not torch.cuda.is_available():
+            print("⚠️  CUDA不可用，回退到CPU模式")
+            self.use_gpu = False
+            return
+        
+        # 检查GPU版本的faiss
+        try:
+            # 尝试导入GPU资源
+            import faiss.contrib.gpu_resources as faiss_gpu
+            
+            # 检查是否有StandardGpuResources属性
+            if hasattr(faiss_gpu, 'StandardGpuResources'):
+                self.gpu_resources = faiss_gpu.StandardGpuResources()
+                
+                # 转换索引到GPU
+                if hasattr(faiss, 'index_cpu_to_gpu'):
+                    self.index = faiss.index_cpu_to_gpu(self.gpu_resources, 0, self.index)
+                    print("✓ 使用Faiss GPU加速")
+                else:
+                    print("⚠️  Faiss GPU转换函数不可用，回退到CPU")
+                    self.use_gpu = False
+            else:
+                print("⚠️  Faiss GPU资源不可用，回退到CPU")
+                self.use_gpu = False
+                
+        except (ImportError, AttributeError) as e:
+            print(f"⚠️  Faiss GPU版本不可用，回退到CPU版本: {e}")
+            self.use_gpu = False
     
     def query(self, query_vector: np.ndarray, k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
         """查询相似向量"""
@@ -94,11 +155,19 @@ class FaissIndex(BaseVectorIndex):
         if self.index is None:
             raise RuntimeError("No index to save")
         
-        if self.use_gpu and torch.cuda.is_available():
-            # 如果是GPU索引，先转换到CPU
-            index_cpu = faiss.index_gpu_to_cpu(self.index)
-            faiss.write_index(index_cpu, filepath)
+        # 如果是GPU索引，先转换到CPU
+        if self.use_gpu and self.gpu_resources is not None:
+            try:
+                # 将GPU索引转回CPU再保存
+                index_cpu = faiss.index_gpu_to_cpu(self.index)
+                faiss.write_index(index_cpu, filepath)
+                print(f"✓ GPU索引已转换到CPU并保存: {filepath}")
+            except Exception as e:
+                print(f"⚠️  GPU索引转换失败，尝试直接保存: {e}")
+                # 尝试直接保存
+                faiss.write_index(self.index, filepath)
         else:
+            # 保存CPU索引
             faiss.write_index(self.index, filepath)
     
     def load(self, filepath: str):
@@ -106,8 +175,21 @@ class FaissIndex(BaseVectorIndex):
         if not FAISS_AVAILABLE:
             raise ImportError("Faiss is not installed")
         
+        # 加载索引
         self.index = faiss.read_index(filepath)
         self.is_built = True
+        
+        # 如果设置了使用GPU，尝试转换到GPU
+        if self.use_gpu and torch.cuda.is_available():
+            try:
+                import faiss.contrib.gpu_resources as faiss_gpu
+                if hasattr(faiss_gpu, 'StandardGpuResources'):
+                    self.gpu_resources = faiss_gpu.StandardGpuResources()
+                    self.index = faiss.index_cpu_to_gpu(self.gpu_resources, 0, self.index)
+                    print("✓ 索引已加载并转换到GPU")
+            except Exception as e:
+                print(f"⚠️  索引加载到GPU失败，使用CPU模式: {e}")
+                self.use_gpu = False
 
 class AnnoyIndexWrapper(BaseVectorIndex):
     """Annoy向量索引包装器"""
@@ -230,7 +312,18 @@ class EEGVectorDatabase:
         """
         self.db_type = db_type
         self.dimension = dimension
-        self.use_gpu = use_gpu
+        
+        # 安全地设置GPU使用
+        self.use_gpu = False  # 默认关闭
+        if use_gpu and db_type == "faiss":
+            has_gpu, has_gpu_api = check_faiss_gpu_availability()
+            if has_gpu and has_gpu_api and torch.cuda.is_available():
+                self.use_gpu = True
+                print("✓ Faiss GPU模式可用")
+            else:
+                print("⚠️  GPU不可用，自动回退到CPU模式")
+                self.use_gpu = False
+        
         self.index_params = index_params or {}
         
         # 数据存储

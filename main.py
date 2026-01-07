@@ -20,6 +20,9 @@ from preprocess import get_data
 from models import get_model, BandAwareInterpretableMamba
 from eeg_vector_db import EEGVectorDatabase  # 新增：脑电向量数据库
 
+plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "WenQuanYi Micro Hei"]
+plt.rcParams["axes.unicode_minus"] = False
+
 # 设置随机种子确保可复现性
 def set_seed(seed=42):
     np.random.seed(seed)
