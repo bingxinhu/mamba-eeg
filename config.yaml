@@ -8,21 +8,23 @@ loso: false
 no_standard: false
 fre_filter: true
 augment: true
-augment_factor: 8
+augment_factor: 10
 
 # 模型参数
 model: "Interpretable_mamba"
-mamba_dim: 128
+mamba_dim: 64
+n_mamba_layers: 4  # 新增：Mamba层数
+mamba_dropout: 0.1  # 新增：Mamba层间Dropout
 dropout: 0.4
-n_attention_heads: 32
+n_attention_heads: 16
 init_type: "kaiming"
 
 # 训练参数
-batch_size: 32
+batch_size: 64
 epochs: 3000
-lr: 0.0005
+lr: 0.0009
 weight_decay: 0.01
-patience: 800
+patience: 500
 mixup: true
 mixup_alpha: 0.4
 grad_clip: 0.5

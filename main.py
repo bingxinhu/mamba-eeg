@@ -85,6 +85,8 @@ def parse_args():
                         choices=['baseline', 'wideband', 'multiband_mamba', 'Interpretable_mamba', 'auto'], 
                         help='选择模型，auto表示自动选择')
     parser.add_argument('--mamba_dim', type=int, default=32, help='Mamba模块特征维度')
+    parser.add_argument('--n_mamba_layers', type=int, default=1, help='Mamba层数')
+    parser.add_argument('--mamba_dropout', type=float, default=0.1, help='Mamba层间Dropout率')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout率')
     parser.add_argument('--n_attention_heads', type=int, default=8, help='注意力头数')
     parser.add_argument('--init_type', type=str, default='kaiming', 
@@ -684,7 +686,10 @@ def main():
                 n_timepoints=n_timepoints,
                 use_freq=args.fre_filter,
                 dropout=args.dropout,
-                mamba_dim=args.mamba_dim
+                mamba_dim=args.mamba_dim,
+                n_attention_heads=args.n_attention_heads,
+                n_mamba_layers=args.n_mamba_layers,
+                mamba_dropout=args.mamba_dropout
             ).to(device)
             
             # 初始化权重
@@ -868,6 +873,23 @@ def main():
         'n_epochs_trained': len(train_losses),
         'config': vars(args)
     }
+    
+    def convert_to_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: convert_to_serializable(value) for key, value in obj.items()}
+        else:
+            return obj
+
+    # 转换results字典中的NumPy类型
+    results = convert_to_serializable(results)
     
     results_file = os.path.join(exp_dir, "results.json")
     with open(results_file, 'w') as f:
