@@ -54,7 +54,6 @@ class MambaWrapper(nn.Module):
                 expand=expand
             )
             self.use_real_mamba = True
-            print("使用真正的Mamba模块 (GPU)")
         else:
             # 使用简化版本（支持CPU）
             self.mamba = SimpleMamba(
@@ -64,7 +63,6 @@ class MambaWrapper(nn.Module):
                 expand=expand
             )
             self.use_real_mamba = False
-            print("使用简化Mamba替代方案 (CPU兼容)")
     
     def forward(self, x):
         # 确保Mamba在正确的设备上
@@ -80,6 +78,30 @@ class MambaWrapper(nn.Module):
             return output[0] if len(output) > 0 else output
         else:
             return output
+
+class MultiLayerMambaBlock(nn.Module):
+    """多层Mamba块，带有残差连接和层归一化"""
+    def __init__(self, d_model, n_layers=2, d_state=16, d_conv=4, expand=2, dropout=0.1):
+        super().__init__()
+        self.n_layers = n_layers
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        for i in range(n_layers):
+            self.layers.append(MambaWrapper(d_model, d_state, d_conv, expand))
+            self.norms.append(nn.LayerNorm(d_model))
+    
+    def forward(self, x):
+        """前向传播，每层都有残差连接"""
+        for i in range(self.n_layers):
+            # 残差连接
+            residual = x
+            x = self.layers[i](x)
+            x = self.dropout(x)
+            x = self.norms[i](x)
+            x = x + residual  # 残差连接
+        return x
 
 class MultiHeadCrossBandAttention(nn.Module):
     """改进的多头跨频段注意力机制"""
@@ -160,17 +182,18 @@ class MultiHeadCrossBandAttention(nn.Module):
 
 class BandAwareInterpretableMamba(nn.Module):
     """
-    频段感知可解释Mamba网络（增强版，支持特征提取）
+    频段感知可解释Mamba网络（增强版，支持多层Mamba）
     
     新增功能：
-    1. 支持多种特征提取方式
-    2. 集成注意力可视化
-    3. 支持向量数据库的特征输出
-    4. 改进的多头跨频段注意力
+    1. 可配置的Mamba层数
+    2. 支持多种特征提取方式
+    3. 集成注意力可视化
+    4. 支持向量数据库的特征输出
+    5. 改进的多头跨频段注意力
     """
     def __init__(self, n_channels=22, n_classes=4, n_timepoints=1125, 
                  d_model=32, d_state=16, n_bands=5, dropout=0.5, use_freq=False,
-                 n_attention_heads=8):
+                 n_attention_heads=8, n_mamba_layers=1, mamba_dropout=0.1):
         super().__init__()
         
         # 根据是否使用多频段滤波调整参数
@@ -189,6 +212,9 @@ class BandAwareInterpretableMamba(nn.Module):
         self.n_classes = n_classes
         self.use_freq = use_freq
         self.n_attention_heads = n_attention_heads
+        self.n_mamba_layers = n_mamba_layers
+        
+        print(f"Mamba层数: {n_mamba_layers}, 维度: {d_model}, Dropout: {dropout}")
         
         # 1. 每个频段的独立处理
         self.band_projections = nn.ModuleList()
@@ -204,14 +230,16 @@ class BandAwareInterpretableMamba(nn.Module):
             )
             self.band_projections.append(proj)
             
-            # 每个频段一个Mamba（如果可用，否则用替代）
-            mamba = MambaWrapper(
+            # 每个频段一个多层Mamba块
+            mamba_block = MultiLayerMambaBlock(
                 d_model=d_model,
+                n_layers=n_mamba_layers,
                 d_state=d_state,
                 d_conv=4,
-                expand=2
+                expand=2,
+                dropout=mamba_dropout
             )
-            self.band_mambas.append(mamba)
+            self.band_mambas.append(mamba_block)
         
         # 2. 改进的多头跨频段注意力机制
         if self.n_bands > 1:
@@ -223,7 +251,7 @@ class BandAwareInterpretableMamba(nn.Module):
         else:
             self.cross_band_attention = None
         
-        # 3. 时间注意力池化（也改为多头）
+        # 3. 时间注意力池化（多头）
         self.temporal_attention = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.Tanh(),
@@ -234,25 +262,44 @@ class BandAwareInterpretableMamba(nn.Module):
         self.temporal_attention_weights = None  # 用于存储注意力权重
         
         # 4. 分类头
+        classifier_input_dim = d_model * self.n_bands
         self.classifier = nn.Sequential(
-            nn.Linear(d_model * self.n_bands, 64),
-            nn.BatchNorm1d(64),
+            nn.Linear(classifier_input_dim, 128),
+            nn.BatchNorm1d(128),
             nn.ELU(),
             nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ELU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(64, n_classes)
         )
         
         # 特征提取层 - 固定输出维度为128以匹配向量数据库
         self.feature_extractor = nn.Sequential(
-            nn.Linear(d_model * self.n_bands, 256),
+            nn.Linear(classifier_input_dim, 256),
             nn.BatchNorm1d(256, momentum=0.1, track_running_stats=True),
             nn.ELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(256, 128),  # 固定输出128维以匹配向量数据库
             nn.BatchNorm1d(128, momentum=0.1, track_running_stats=True),
             nn.Tanh()
         )
         
+        # 初始化权重
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """初始化权重"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
     def forward(self, x):
         # x: (batch, 1, n_channels, n_timepoints)
         batch_size, _, total_channels, timepoints = x.shape
@@ -274,7 +321,7 @@ class BandAwareInterpretableMamba(nn.Module):
             proj = self.band_projections[i](band_data)  # (batch, d_model, timepoints)
             proj = proj.transpose(1, 2)                 # (batch, timepoints, d_model)
             
-            # Mamba处理
+            # 多层Mamba处理
             mamba_out = self.band_mambas[i](proj)      # (batch, timepoints, d_model)
             band_features.append(mamba_out)
         
@@ -479,241 +526,10 @@ class BandAwareInterpretableMamba(nn.Module):
         
         return attention_weights
 
-# 下面原有的其他模型类保持不变...
-
-"""针对多频段数据的专用Mamba网络（添加BatchNorm层）"""
-class MultiBandMambaNet(nn.Module):
-    def __init__(self, n_channels, n_classes, n_timepoints, dropout=0.5, mamba_dim=32):
-        super(MultiBandMambaNet, self).__init__()
-        self.n_bands = 5
-        raw_channels = n_channels // self.n_bands
-        
-        # 频段分离卷积 - 在每个卷积层后添加BatchNorm
-        self.band_convs = nn.ModuleList()
-        for _ in range(self.n_bands):
-            conv = nn.Sequential(
-                nn.Conv2d(1, 8, kernel_size=(raw_channels, 1), padding=0),
-                nn.BatchNorm2d(8),  # 新增BatchNorm
-                nn.ELU(),
-                nn.Conv2d(8, 16, kernel_size=(1, 15), padding=(0, 7)),
-                nn.BatchNorm2d(16),  # 新增BatchNorm
-                nn.ELU(),
-                nn.Dropout2d(dropout),
-                nn.AvgPool2d((1, 2))
-            )
-            self.band_convs.append(conv)
-        
-        # 频段融合 - 在融合层后添加BatchNorm
-        self.band_fusion = nn.Sequential(
-            nn.Conv2d(16 * self.n_bands, mamba_dim, kernel_size=(1, 3), stride=(1, 2), padding=(0, 1)),
-            nn.BatchNorm2d(mamba_dim),  # 新增BatchNorm
-            nn.ELU(),
-            nn.Dropout2d(dropout)
-        )
-        
-        # Mamba前的BatchNorm层 - 新增
-        self.before_mamba_bn = nn.BatchNorm1d(mamba_dim)
-        
-        # 使用Mamba包装器
-        self.mamba = MambaWrapper(
-            d_model=mamba_dim,
-            d_state=16,
-            d_conv=4,
-            expand=2
-        )
-        
-        # Mamba后的BatchNorm层 - 新增
-        self.after_mamba_bn = nn.BatchNorm1d(mamba_dim)
-        
-        # 分类头
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(mamba_dim, 32),
-            nn.BatchNorm1d(32),
-            nn.ELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, n_classes)
-        )
-        
-    def forward(self, x):
-        raw_channels = x.size(2) // self.n_bands
-        
-        # 分离频段
-        band_features = []
-        for i in range(self.n_bands):
-            start_idx = i * raw_channels
-            end_idx = (i + 1) * raw_channels
-            band_data = x[:, :, start_idx:end_idx, :]
-            band_feat = self.band_convs[i](band_data)
-            band_features.append(band_feat)
-        
-        # 合并频段特征
-        x = torch.cat(band_features, dim=1)
-        
-        # 频段融合
-        x = self.band_fusion(x)
-        
-        # Mamba输入处理
-        if x.dim() == 4:
-            x = x.squeeze(2)  # (batch, mamba_dim, seq_len)
-        
-        # Mamba前的BatchNorm
-        x = self.before_mamba_bn(x)
-        
-        # 转置为Mamba需要的格式
-        x = x.transpose(1, 2)  # (batch, seq_len, mamba_dim)
-        
-        # Mamba前向传播
-        x = self.mamba(x)
-        
-        # Mamba后的BatchNorm（需要在转置后应用）
-        x = x.transpose(1, 2)  # (batch, mamba_dim, seq_len)
-        x = self.after_mamba_bn(x)
-        x = x.transpose(1, 2)  # (batch, seq_len, mamba_dim)
-        
-        # 分类
-        x = x.transpose(1, 2).unsqueeze(2)  # (batch, mamba_dim, 1, seq_len)
-        out = self.classifier(x)
-        return out
-    
-    def extract_features(self, x, feature_type='pre_classifier'):
-        """简化版特征提取"""
-        # 执行前向传播直到分类器前
-        raw_channels = x.size(2) // self.n_bands
-        
-        # 分离频段
-        band_features = []
-        for i in range(self.n_bands):
-            start_idx = i * raw_channels
-            end_idx = (i + 1) * raw_channels
-            band_data = x[:, :, start_idx:end_idx, :]
-            band_feat = self.band_convs[i](band_data)
-            band_features.append(band_feat)
-        
-        # 合并频段特征
-        x = torch.cat(band_features, dim=1)
-        
-        # 频段融合
-        x = self.band_fusion(x)
-        
-        # Mamba输入处理
-        if x.dim() == 4:
-            x = x.squeeze(2)
-        
-        # Mamba前的BatchNorm
-        x = self.before_mamba_bn(x)
-        
-        # 转置为Mamba需要的格式
-        x = x.transpose(1, 2)
-        
-        # Mamba前向传播
-        x = self.mamba(x)
-        
-        # Mamba后的BatchNorm
-        x = x.transpose(1, 2)
-        x = self.after_mamba_bn(x)
-        
-        # 全局平均池化
-        features = F.adaptive_avg_pool1d(x, 1).squeeze(-1)
-        return features
-
-"""基线EEGNet（Shallow ConvNet）"""
-class BaselineEEGNet(nn.Module):
-    def __init__(self, n_channels, n_classes, n_timepoints, dropout=0.5):
-        super(BaselineEEGNet, self).__init__()
-        
-        self.time_conv = nn.Sequential(
-            nn.Conv2d(1, 40, kernel_size=(1, 25), stride=1, padding=(0, 12)),
-            nn.Conv2d(40, 40, kernel_size=(n_channels, 1), stride=1),
-            nn.BatchNorm2d(40),
-        )
-        
-        self.depthwise_conv = nn.Conv2d(40, 40, kernel_size=(1, 15), stride=1, padding=(0, 7), groups=40)
-        self.bn2 = nn.BatchNorm2d(40)
-        self.pool = nn.AvgPool2d(kernel_size=(1, 75), stride=(1, 15))
-        
-        time_dim = n_timepoints
-        time_dim = (time_dim - 15 + 14) // 1 + 1
-        time_dim = (time_dim - 75 + 0) // 15 + 1
-        
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Flatten(),
-            nn.Linear(40 * time_dim, n_classes)
-        )
-
-    def forward(self, x):
-        x = self.time_conv(x)
-        x = self.depthwise_conv(x)
-        x = self.bn2(x)
-        x = x * x  # 平方激活
-        x = self.pool(x)
-        x = torch.log(torch.clamp(x, min=1e-6))
-        out = self.classifier(x)
-        return out
-    
-    def extract_features(self, x, feature_type='pre_classifier'):
-        """提取特征"""
-        x = self.time_conv(x)
-        x = self.depthwise_conv(x)
-        x = self.bn2(x)
-        x = x * x
-        x = self.pool(x)
-        x = torch.log(torch.clamp(x, min=1e-6))
-        
-        # 展平作为特征
-        features = x.flatten(1)
-        return features
-
-class WidebandEEGNet(nn.Module):
-    """宽频带EEGNet（用于单频段数据）"""
-    def __init__(self, n_channels, n_classes, n_timepoints, use_freq=False, dropout=0.5):
-        super(WidebandEEGNet, self).__init__()
-        
-        # 简化结构
-        self.conv1 = nn.Conv2d(1, 8, kernel_size=(1, 64), padding=(0, 32))
-        self.bn1 = nn.BatchNorm2d(8)
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=(n_channels, 1))
-        self.bn2 = nn.BatchNorm2d(16)
-        self.pool = nn.AvgPool2d((1, 4))
-        
-        # 计算特征维度
-        time_dim = (n_timepoints - 64 + 64) // 1  # 卷积后时间维度
-        time_dim = time_dim // 4  # 池化后时间维度
-        
-        self.feature_dim = 16 * time_dim
-        
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Flatten(),
-            nn.Linear(self.feature_dim, 64),
-            nn.BatchNorm1d(64),
-            nn.ELU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, n_classes)
-        )
-        
-    def forward(self, x):
-        x = F.elu(self.bn1(self.conv1(x)))
-        x = F.elu(self.bn2(self.conv2(x)))
-        x = self.pool(x)
-        x = torch.log(torch.clamp(x, min=1e-6))
-        return self.classifier(x)
-    
-    def extract_features(self, x, feature_type='pre_classifier'):
-        """提取特征"""
-        x = F.elu(self.bn1(self.conv1(x)))
-        x = F.elu(self.bn2(self.conv2(x)))
-        x = self.pool(x)
-        x = torch.log(torch.clamp(x, min=1e-6))
-        
-        features = x.flatten(1)
-        return features
-
-# 修改 get_model 函数
+# 修改get_model函数以支持n_mamba_layers参数
 def get_model(model_name, n_channels, n_classes, n_timepoints, use_freq=False, 
-              dropout=0.5, mamba_dim=32, n_attention_heads=8):  # 添加n_attention_heads参数
+              dropout=0.5, mamba_dim=32, n_attention_heads=8, n_mamba_layers=1, mamba_dropout=0.1):
+    """获取模型，支持多层Mamba配置"""
     if model_name == "wideband":
         return WidebandEEGNet(n_channels, n_classes, n_timepoints, use_freq, dropout)
     elif model_name == "multiband_mamba":
@@ -727,7 +543,9 @@ def get_model(model_name, n_channels, n_classes, n_timepoints, use_freq=False,
             n_bands=5 if use_freq else 1,
             dropout=dropout,
             use_freq=use_freq,
-            n_attention_heads=n_attention_heads  # 传递注意力头数
+            n_attention_heads=n_attention_heads,
+            n_mamba_layers=n_mamba_layers,
+            mamba_dropout=mamba_dropout
         )
     elif model_name == "baseline":
         return BaselineEEGNet(n_channels, n_classes, n_timepoints, dropout)

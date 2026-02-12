@@ -1,8 +1,3 @@
-"""
-注意力权重可视化模块（修复版）
-用于可视化跨频段注意力和时间注意力权重
-"""
-
 import numpy as np
 import torch
 import matplotlib.pyplot as plt

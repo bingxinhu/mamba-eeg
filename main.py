@@ -85,6 +85,8 @@ def parse_args():
                         choices=['baseline', 'wideband', 'multiband_mamba', 'Interpretable_mamba', 'auto'], 
                         help='选择模型，auto表示自动选择')
     parser.add_argument('--mamba_dim', type=int, default=32, help='Mamba模块特征维度')
+    parser.add_argument('--n_mamba_layers', type=int, default=1, help='Mamba层数')
+    parser.add_argument('--mamba_dropout', type=float, default=0.1, help='Mamba层间Dropout率')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout率')
     parser.add_argument('--n_attention_heads', type=int, default=8, help='注意力头数')
     parser.add_argument('--init_type', type=str, default='kaiming', 
@@ -565,9 +567,9 @@ def few_shot_learning_with_vector_db(vector_db, test_loader, model, device, args
                 # 记录检索信息
                 few_shot_results.append({
                     'true_label': int(labels[i].item()),
-                    'predicted_label': pred,
-                    'retrieved_labels': retrieved_labels,
-                    'retrieved_distances': [s['distance'] for s in similar_samples]
+                    'predicted_label': int(pred),
+                    'retrieved_labels': [int(l) for l in retrieved_labels],
+                    'retrieved_distances': [float(s['distance']) for s in similar_samples]
                 })
             
             predictions.extend(batch_predictions)
@@ -684,7 +686,10 @@ def main():
                 n_timepoints=n_timepoints,
                 use_freq=args.fre_filter,
                 dropout=args.dropout,
-                mamba_dim=args.mamba_dim
+                mamba_dim=args.mamba_dim,
+                n_attention_heads=args.n_attention_heads,
+                n_mamba_layers=args.n_mamba_layers,
+                mamba_dropout=args.mamba_dropout
             ).to(device)
             
             # 初始化权重
@@ -869,6 +874,23 @@ def main():
         'config': vars(args)
     }
     
+    def convert_to_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: convert_to_serializable(value) for key, value in obj.items()}
+        else:
+            return obj
+
+    # 转换results字典中的NumPy类型
+    results = convert_to_serializable(results)
+    
     results_file = os.path.join(exp_dir, "results.json")
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=4)
@@ -903,9 +925,11 @@ def main():
             # 保存少样本学习结果
             few_shot_file = os.path.join(exp_dir, "few_shot_results.json")
             with open(few_shot_file, 'w') as f:
+                # 使用已有的转换函数处理数据，确保所有类型都是 JSON 可序列化的
+                serializable_samples = convert_to_serializable(few_shot_results[:100])
                 json.dump({
                     'few_shot_accuracy': float(few_shot_acc),
-                    'samples': few_shot_results[:100]  # 只保存前100个样本
+                    'samples': serializable_samples  # 只保存前100个样本
                 }, f, indent=4)
             
             print(f"✓ 少样本学习结果已保存至 {few_shot_file}")
