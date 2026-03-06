@@ -350,7 +350,7 @@ def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=False,
     
     # 5. 多频段滤波（提取EEG关键频段）
     if fre_filter:
-        filt_banks = [[1,4], [4,8], [8,12], [12,30], [30,40]]  # δ,θ,α,β,γ
+        filt_banks = [[1,4], [4,8], [8,10], [10,12], [12,18], [18,24], [24,30], [30,40], [40,60], [60,80]]  # δ,θ,α1,α2,β1,β2,β3,γ1,γ2,γ3
         n_bands = len(filt_banks)
         # 初始化多频段数据存储
         X_train_bands = np.zeros((X_train.shape[0], 1, n_raw_chans * n_bands, T))

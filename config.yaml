@@ -2,7 +2,7 @@
 
 # 数据参数
 data_path: "./dataset/2a"
-subject: 4
+subject: 7
 dataset: "BCI2a"
 loso: false
 no_standard: false
@@ -12,8 +12,8 @@ augment_factor: 10
 
 # 模型参数
 model: "Interpretable_mamba"
-mamba_dim: 32
-n_mamba_layers: 8  # 新增：Mamba层数
+mamba_dim: 64
+n_mamba_layers: 4  # 新增：Mamba层数
 mamba_dropout: 0.1  # 新增：Mamba层间Dropout
 dropout: 0.4
 n_attention_heads: 32
@@ -21,8 +21,8 @@ init_type: "kaiming"
 
 # 训练参数
 batch_size: 32
-epochs: 3000
-lr: 0.0009
+epochs: 2000
+lr: 0.0005
 weight_decay: 0.01
 patience: 500
 mixup: true
